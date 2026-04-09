@@ -24,3 +24,6 @@ autopilot_*.log
 # OS
 Thumbs.db
 Desktop.ini
+
+#V Env
+venv/

@@ -27,14 +27,16 @@ _MODELS = [
 
 
 def _get_client():
-    """Initialize Gemini client."""
+    """Initialize Gemini client with a long timeout."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key or api_key == "your_api_key_here":
         raise ValueError(
             "Set your GEMINI_API_KEY in .env file.\n"
             "Get a free key at: https://aistudio.google.com/apikey"
         )
-    return genai.Client(api_key=api_key)
+    # Set a long timeout for batch analysis
+    from google.genai import Client
+    return genai.Client(api_key=api_key, http_options={'timeout': 300})
 
 
 def _call_gemini(client, prompt: str, retries: int = _MAX_RETRIES) -> str:
