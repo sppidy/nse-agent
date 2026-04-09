@@ -258,6 +258,134 @@ def analyze_watchlist(watchlist: list[str] | None = None) -> list[dict]:
     return analyze_batch(stock_data)
 
 
+import asyncio
+
+async def _call_gemini_async(client, prompt: str, retries: int = _MAX_RETRIES) -> str:
+    """Call Gemini with model fallback and retry on rate limits (Async)."""
+    for model in _MODELS:
+        for attempt in range(retries):
+            try:
+                response = await client.aio.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                )
+                return response.text.strip()
+            except Exception as e:
+                error_str = str(e)
+                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                    if attempt < retries - 1:
+                        wait = _MIN_DELAY_BETWEEN_CALLS * (attempt + 2)
+                        print(f"    Rate limited on {model}, waiting {wait}s...")
+                        await asyncio.sleep(wait)
+                    else:
+                        print(f"    {model} exhausted, trying next model...")
+                        break
+                elif "404" in error_str or "NOT_FOUND" in error_str:
+                    break
+                else:
+                    raise
+    raise Exception("All Gemini models exhausted. Try again later or check your API quota.")
+
+async def analyze_batch_async(stock_data: list[tuple[str, pd.DataFrame]]) -> list[dict]:
+    """Analyze ALL stocks in a single Gemini call to save API quota (Async)."""
+    client = _get_client()
+
+    summaries = []
+    symbols = []
+    for symbol, df in stock_data:
+        summaries.append(_prepare_stock_summary(symbol, df))
+        symbols.append(symbol)
+
+    all_summaries = "\n---\n".join(summaries)
+
+    from learner import get_learning_context
+    learning = await asyncio.to_thread(get_learning_context)
+
+    from news_sentiment import get_sentiment_context
+    news_context = await asyncio.to_thread(get_sentiment_context, symbols)
+
+    prompt = f"""You are a quantitative trading analyst that learns from past performance and reads market news.
+
+{learning}
+
+{news_context}
+
+STOCKS DATA:
+{all_summaries}
+
+PORTFOLIO: Rs.{config.INITIAL_CAPITAL} capital, max {config.MAX_POSITION_SIZE_PCT*100}% per position, {config.STOP_LOSS_PCT*100}% stop loss, {config.TAKE_PROFIT_PCT*100}% take profit.
+
+IMPORTANT RULES:
+1. Use trade history to avoid repeating losing patterns and favor winning setups.
+2. NEWS SENTIMENT is critical — if news is bearish for a stock, lower confidence even if technicals look good. If news is very bullish, boost confidence.
+3. If overall market mood is BEARISH, be more cautious with all BUY signals.
+4. If a company has negative news (scandal, downgrade, earnings miss), signal SELL or HOLD regardless of technicals.
+
+Respond ONLY with a valid JSON array (no markdown, no extra text). One object per stock:
+[
+  {{
+    "symbol": "SYMBOL.NS",
+    "signal": "BUY" or "SELL" or "HOLD",
+    "confidence": 0.0 to 1.0,
+    "reason": "brief explanation",
+    "entry_price": number or null,
+    "stop_loss": number or null,
+    "target": number or null
+  }}
+]"""
+
+    try:
+        text = await _call_gemini_async(client, prompt)
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1]
+            text = text.rsplit("```", 1)[0]
+        results = json.loads(text)
+
+        price_map = {}
+        for symbol, df in stock_data:
+            if not df.empty:
+                price_map[symbol] = float(df["Close"].dropna().iloc[-1])
+        for r in results:
+            sym = r.get("symbol", "")
+            r["price"] = price_map.get(sym, 0)
+
+        return results
+    except Exception as e:
+        print(f"    Batch analysis failed: {e}")
+        return [
+            {
+                "symbol": sym,
+                "signal": "HOLD",
+                "confidence": 0.0,
+                "reason": f"AI analysis failed: {e}",
+                "price": float(df["Close"].dropna().iloc[-1]) if not df.empty else 0,
+            }
+            for sym, df in stock_data
+        ]
+
+async def analyze_watchlist_async(watchlist: list[str] | None = None) -> list[dict]:
+    """Analyze all stocks in watchlist using a single batched Gemini call (Async)."""
+    from data_fetcher import get_historical_data
+
+    if watchlist is None:
+        watchlist = config.WATCHLIST
+
+    def fetch_all():
+        data = []
+        for symbol in watchlist:
+            df = get_historical_data(symbol, period="60d", interval="1d")
+            if not df.empty:
+                data.append((symbol, df))
+        return data
+        
+    stock_data = await asyncio.to_thread(fetch_all)
+
+    if not stock_data:
+        return []
+
+    print(f"  Sending {len(stock_data)} stocks to Gemini in one batch (async)...")
+    return await analyze_batch_async(stock_data)
+
 def get_portfolio_advice(portfolio_summary: dict, signals: list[dict]) -> str:
     """Get Gemini's advice on overall portfolio strategy."""
     client = _get_client()
