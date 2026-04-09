@@ -1,0 +1,26 @@
+# Environment & secrets
+.env
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# ML models — tracked in git for server deployment
+# models/
+
+# Runtime data (changes every cycle)
+portfolio.json
+trade_journal.json
+training_log.json
+lessons_learned.json
+yfinance.cache
+
+# Logs
+logs/
+autopilot_*.log
+
+# OS
+Thumbs.db
+Desktop.ini
