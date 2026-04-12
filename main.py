@@ -10,6 +10,7 @@ from paper_trader import PaperTrader, Portfolio
 from strategy import get_latest_signal, generate_signals
 from backtester import backtest, backtest_portfolio, print_backtest_report
 from ai_strategy import analyze_single_stock, analyze_watchlist, get_portfolio_advice
+from market_calendar import is_market_trading_day
 
 
 def cmd_ai_scan():
@@ -36,6 +37,10 @@ def cmd_ai_scan():
 
 def cmd_ai_trade():
     """Run one AI-powered paper trading cycle."""
+    if not is_market_trading_day():
+        print("\nMarket is closed for weekend/holiday. Skipping AI trade cycle.")
+        return
+
     trader = PaperTrader()
     print("\n[AI] Running Gemini-powered trading cycle...\n")
 
@@ -134,6 +139,10 @@ def cmd_backtest(symbols=None, period="60d"):
 
 def cmd_trade():
     """Run one cycle of the paper trading bot."""
+    if not is_market_trading_day():
+        print("\nMarket is closed for weekend/holiday. Skipping trade cycle.")
+        return
+
     trader = PaperTrader()
     print("\nRunning trading cycle...")
 
