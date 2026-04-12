@@ -1,6 +1,5 @@
 """Paper trading engine — simulates order execution and tracks portfolio."""
 
-import json
 import os
 import random
 from datetime import datetime
@@ -8,6 +7,8 @@ from dataclasses import dataclass, field, asdict
 from enum import Enum
 
 import config
+from logger import logger
+from persistence import read_json, write_json_atomic
 
 
 class OrderSide(str, Enum):
@@ -98,18 +99,16 @@ class Portfolio:
             "trade_log": self.trade_log,
             "total_realized_pnl": self.total_realized_pnl,
         }
-        with open(filepath, "w") as f:
-            json.dump(data, f, indent=2)
+        write_json_atomic(filepath, data)
 
     @classmethod
     def load(cls, filepath: str = "portfolio.json") -> "Portfolio":
         filepath = cls._resolve_path(filepath)
         if not os.path.exists(filepath):
             return cls()
-        with open(filepath) as f:
-            data = json.load(f)
+        data = read_json(filepath, default={})
         portfolio = cls(
-            cash=data["cash"],
+            cash=data.get("cash", config.INITIAL_CAPITAL),
             total_realized_pnl=data.get("total_realized_pnl", 0),
         )
         for sym, pos_data in data.get("positions", {}).items():
@@ -124,8 +123,18 @@ class PaperTrader:
         self.portfolio = portfolio or Portfolio.load()
         self._order_counter = len(self.portfolio.orders)
 
-    def buy(self, symbol: str, price: float, quantity: int | None = None, confidence: float = 0.0) -> Order | None:
+    def buy(
+        self,
+        symbol: str,
+        price: float,
+        quantity: int | None = None,
+        confidence: float = 0.0,
+        max_position_size_pct: float | None = None,
+    ) -> Order | None:
         """Place a simulated buy order."""
+        if max_position_size_pct is None:
+            max_position_size_pct = config.MAX_POSITION_SIZE_PCT
+
         # Simulate dynamic slippage (liquidity constraints)
         slippage = config.SLIPPAGE_PCT * random.uniform(0.5, 2.0)
         fill_price = price * (1 + slippage)
@@ -145,16 +154,19 @@ class PaperTrader:
                 
                 # Cap the maximum bet at the config limit (e.g. 10% or dynamically halved by regime)
                 # And ensure it's not negative
-                optimal_bet_pct = max(0.01, min(half_kelly, config.MAX_POSITION_SIZE_PCT))
+                optimal_bet_pct = max(0.01, min(half_kelly, max_position_size_pct))
                 max_spend = self.portfolio.cash * optimal_bet_pct
             else:
                 # Fallback to static if no confidence is provided
-                max_spend = self.portfolio.cash * config.MAX_POSITION_SIZE_PCT
+                max_spend = self.portfolio.cash * max_position_size_pct
                 
             quantity = int(max_spend / fill_price)
 
         if quantity <= 0:
-            print(f"Cannot buy {symbol}: insufficient funds (need Rs.{fill_price:.2f}, have Rs.{self.portfolio.cash:.2f})")
+            logger.warning(
+                f"Cannot buy {symbol}: insufficient funds "
+                f"(need Rs.{fill_price:.2f}, have Rs.{self.portfolio.cash:.2f})"
+            )
             return None
 
         total_cost = quantity * fill_price + brokerage
@@ -162,13 +174,13 @@ class PaperTrader:
             # Reduce quantity to fit
             quantity = int((self.portfolio.cash - brokerage) / fill_price)
             if quantity <= 0:
-                print(f"Cannot buy {symbol}: insufficient funds")
+                logger.warning(f"Cannot buy {symbol}: insufficient funds")
                 return None
             total_cost = quantity * fill_price + brokerage
 
         # Check max positions
         if symbol not in self.portfolio.positions and len(self.portfolio.positions) >= config.MAX_OPEN_POSITIONS:
-            print(f"Cannot buy {symbol}: max {config.MAX_OPEN_POSITIONS} positions reached")
+            logger.warning(f"Cannot buy {symbol}: max {config.MAX_OPEN_POSITIONS} positions reached")
             return None
 
         # Execute
@@ -201,13 +213,13 @@ class PaperTrader:
 
         self.portfolio.orders.append(asdict(order))
         self.portfolio.save()
-        print(f"BUY {quantity}x {symbol} @ Rs.{fill_price:.2f} = Rs.{total_cost:.2f}")
+        logger.info(f"BUY {quantity}x {symbol} @ Rs.{fill_price:.2f} = Rs.{total_cost:.2f}")
         return order
 
     def sell(self, symbol: str, price: float, quantity: int | None = None) -> Order | None:
         """Place a simulated sell order."""
         if symbol not in self.portfolio.positions:
-            print(f"Cannot sell {symbol}: no position held")
+            logger.warning(f"Cannot sell {symbol}: no position held")
             return None
 
         pos = self.portfolio.positions[symbol]
@@ -261,12 +273,11 @@ class PaperTrader:
         self.portfolio.orders.append(asdict(order))
         self.portfolio.save()
         pnl_str = f"+Rs.{pnl:.2f}" if pnl >= 0 else f"-Rs.{abs(pnl):.2f}"
-        print(f"SELL {quantity}x {symbol} @ Rs.{fill_price:.2f} | P&L: {pnl_str}")
+        logger.info(f"SELL {quantity}x {symbol} @ Rs.{fill_price:.2f} | P&L: {pnl_str}")
         return order
 
     def check_stop_loss_take_profit(self, prices: dict[str, float]) -> list[Order]:
         """Check and execute trailing stop-loss / take-profit for all positions."""
-        from logger import logger
         orders = []
         for symbol, pos in list(self.portfolio.positions.items()):
             current = prices.get(symbol)
