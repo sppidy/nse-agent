@@ -16,24 +16,8 @@ from strategy import get_latest_signal
 from learner import log_trade, record_outcome, get_snapshot, generate_lessons, print_performance_report
 from predictor import predict, train_model, should_retrain
 from logger import logger
+from market_calendar import now_ist, is_market_trading_day, MARKET_OPEN_TIME, MARKET_CLOSE_TIME
 from persistence import read_json, write_json_atomic
-
-
-# IST offset from UTC
-IST_OFFSET = timedelta(hours=5, minutes=30)
-
-# Market hours (IST)
-MARKET_OPEN_HOUR = 9
-MARKET_OPEN_MIN = 15
-MARKET_CLOSE_HOUR = 15
-MARKET_CLOSE_MIN = 30
-
-
-def now_ist() -> datetime:
-    """Get current time in IST."""
-    from datetime import timezone
-    utc_now = datetime.now(timezone.utc)
-    return utc_now + IST_OFFSET
 
 
 def is_market_open() -> bool:
@@ -42,8 +26,20 @@ def is_market_open() -> bool:
     # Weekday check (Mon=0, Fri=4)
     if t.weekday() > 4:
         return False
-    market_open = t.replace(hour=MARKET_OPEN_HOUR, minute=MARKET_OPEN_MIN, second=0)
-    market_close = t.replace(hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MIN, second=0)
+    if not is_market_trading_day(t.date()):
+        return False
+    market_open = t.replace(
+        hour=MARKET_OPEN_TIME.hour,
+        minute=MARKET_OPEN_TIME.minute,
+        second=0,
+        microsecond=0,
+    )
+    market_close = t.replace(
+        hour=MARKET_CLOSE_TIME.hour,
+        minute=MARKET_CLOSE_TIME.minute,
+        second=0,
+        microsecond=0,
+    )
     return market_open <= t <= market_close
 
 
@@ -52,15 +48,25 @@ def time_to_market_open() -> timedelta | None:
     if is_market_open():
         return None
     t = now_ist()
-    today_open = t.replace(hour=MARKET_OPEN_HOUR, minute=MARKET_OPEN_MIN, second=0, microsecond=0)
-    if t < today_open and t.weekday() <= 4:
+    today_open = t.replace(
+        hour=MARKET_OPEN_TIME.hour,
+        minute=MARKET_OPEN_TIME.minute,
+        second=0,
+        microsecond=0,
+    )
+    if t < today_open and is_market_trading_day(t.date()):
         return today_open - t
-    # Next weekday
+    # Next verified market session day
     days_ahead = 1
     while True:
         next_day = t + timedelta(days=days_ahead)
-        if next_day.weekday() <= 4:
-            next_open = next_day.replace(hour=MARKET_OPEN_HOUR, minute=MARKET_OPEN_MIN, second=0, microsecond=0)
+        if is_market_trading_day(next_day.date()):
+            next_open = next_day.replace(
+                hour=MARKET_OPEN_TIME.hour,
+                minute=MARKET_OPEN_TIME.minute,
+                second=0,
+                microsecond=0,
+            )
             return next_open - t
         days_ahead += 1
 

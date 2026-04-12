@@ -8,6 +8,7 @@ from enum import Enum
 
 import config
 from logger import logger
+from market_calendar import is_market_trading_day
 from persistence import read_json, write_json_atomic
 
 
@@ -132,6 +133,10 @@ class PaperTrader:
         max_position_size_pct: float | None = None,
     ) -> Order | None:
         """Place a simulated buy order."""
+        if not is_market_trading_day():
+            logger.warning(f"Cannot buy {symbol}: non-trading day (weekend/holiday)")
+            return None
+
         if max_position_size_pct is None:
             max_position_size_pct = config.MAX_POSITION_SIZE_PCT
 
@@ -218,6 +223,10 @@ class PaperTrader:
 
     def sell(self, symbol: str, price: float, quantity: int | None = None) -> Order | None:
         """Place a simulated sell order."""
+        if not is_market_trading_day():
+            logger.warning(f"Cannot sell {symbol}: non-trading day (weekend/holiday)")
+            return None
+
         if symbol not in self.portfolio.positions:
             logger.warning(f"Cannot sell {symbol}: no position held")
             return None
@@ -278,6 +287,10 @@ class PaperTrader:
 
     def check_stop_loss_take_profit(self, prices: dict[str, float]) -> list[Order]:
         """Check and execute trailing stop-loss / take-profit for all positions."""
+        if not is_market_trading_day():
+            logger.info("Skipping stop-loss/take-profit checks: non-trading day (weekend/holiday)")
+            return []
+
         orders = []
         for symbol, pos in list(self.portfolio.positions.items()):
             current = prices.get(symbol)
