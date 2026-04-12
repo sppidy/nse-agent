@@ -4,8 +4,8 @@
 
 $TaskName = "AI-Trading-Autopilot"
 $Description = "Runs AI Trading Agent autopilot during Indian market hours (Mon-Fri)"
-$BatchFile = "B:\projects\ai-trading-agent\start_autopilot.bat"
-$WorkingDir = "B:\projects\ai-trading-agent"
+$WorkingDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$BatchFile = Join-Path $WorkingDir "start_autopilot.bat"
 
 # Remove existing task if present
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue

@@ -8,7 +8,7 @@ import config
 from data_fetcher import get_historical_data, get_live_price, get_watchlist_prices
 from paper_trader import PaperTrader, Portfolio
 from strategy import get_latest_signal, generate_signals
-from backtester import backtest, print_backtest_report
+from backtester import backtest, backtest_portfolio, print_backtest_report
 from ai_strategy import analyze_single_stock, analyze_watchlist, get_portfolio_advice
 
 
@@ -20,8 +20,9 @@ def cmd_ai_scan():
     for sig in signals:
         indicator = {"BUY": ">>", "SELL": "<<", "HOLD": "  "}.get(sig.get("signal", "HOLD"), "  ")
         confidence = sig.get("confidence", 0)
+        size_pct = sig.get("position_size_pct", confidence) * 100
         conf_bar = "#" * int(confidence * 10) + "." * (10 - int(confidence * 10))
-        print(f"  {indicator} {sig['symbol']:20s}  Rs.{sig.get('price', 0):>10.2f}  {sig.get('signal', 'HOLD'):4s}  [{conf_bar}] {confidence:.0%}")
+        print(f"  {indicator} {sig['symbol']:20s}  Rs.{sig.get('price', 0):>10.2f}  {sig.get('signal', 'HOLD'):4s}  [{conf_bar}] {confidence:.0%}  Size:{size_pct:.0f}%")
         print(f"     {sig.get('reason', '')}")
         if sig.get("stop_loss"):
             print(f"     SL: Rs.{sig['stop_loss']:.2f}  Target: Rs.{sig.get('target', 0):.2f}")
@@ -107,14 +108,27 @@ def cmd_backtest(symbols=None, period="60d"):
         symbols = config.WATCHLIST
     print(f"\nBacktesting {len(symbols)} stocks over {period}...\n")
     results = []
+    data_by_symbol = {}
     for symbol in symbols:
         df = get_historical_data(symbol, period=period, interval="1d")
         if df.empty:
             results.append({"symbol": symbol, "error": "No data"})
             continue
+        data_by_symbol[symbol] = df
         result = backtest(symbol, df)
         results.append(result)
     print_backtest_report(results)
+
+    portfolio_result = backtest_portfolio(data_by_symbol, initial_capital=config.INITIAL_CAPITAL)
+    if "error" not in portfolio_result:
+        print("\nPORTFOLIO-LEVEL BACKTEST (shared capital)")
+        print("-" * 50)
+        print(f"Initial Capital: Rs.{portfolio_result['initial_capital']:.2f}")
+        print(f"Final Equity:    Rs.{portfolio_result['final_equity']:.2f}")
+        print(f"Return:          {portfolio_result['total_return_pct']:+.2f}%")
+        print(f"Trades:          {portfolio_result['total_trades']}  | Win Rate: {portfolio_result['win_rate']:.1f}%")
+        print(f"Realized P&L:    Rs.{portfolio_result['total_pnl']:.2f}")
+        print(f"Open Positions:  {portfolio_result['open_positions']}")
     return results
 
 
@@ -227,6 +241,18 @@ def cmd_train():
     print(f"\n  Training complete!")
     print(f"  Samples: {metrics['samples']} | Symbols: {metrics['symbols']}")
     print(f"  Cross-validation accuracy: {metrics['cv_accuracy']}%")
+    print(f"  Walk-forward: Acc {metrics.get('walk_forward_accuracy', 0)}% | "
+          f"Precision {metrics.get('walk_forward_precision', 0)}% | "
+          f"Recall {metrics.get('walk_forward_recall', 0)}% | "
+          f"F1 {metrics.get('walk_forward_f1', 0)}%")
+    print(f"  Holdout: Acc {metrics.get('holdout_accuracy', 0)}% | "
+          f"Precision {metrics.get('holdout_precision', 0)}% | "
+          f"Recall {metrics.get('holdout_recall', 0)}% | "
+          f"F1 {metrics.get('holdout_f1', 0)}%")
+    print(f"  Baseline accuracy: {metrics.get('baseline_accuracy', 0)}% "
+          f"(UP class ratio: {metrics.get('up_class_ratio', 0)}%)")
+    print(f"  Model promoted: {metrics.get('model_promoted', True)} "
+          f"({metrics.get('promotion_reason', 'n/a')})")
     print(f"  CV scores: {metrics['cv_scores']}")
     print(f"  Top features: {', '.join(metrics['top_features'].keys())}")
     print(f"  Model saved to: {metrics['model_path']}")
@@ -276,7 +302,7 @@ Commands:
   predict   Get ML predictions for tomorrow
   status    Show portfolio and P&L
   report    Show learning report (win rate, patterns, lessons)
-  reset     Reset portfolio to Rs.1000
+  reset     Reset portfolio to configured initial capital
   help      Show this message
 
 Examples:

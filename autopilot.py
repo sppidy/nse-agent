@@ -6,6 +6,7 @@ import sys
 from datetime import datetime, timedelta
 
 import yfinance as yf
+import pandas as pd
 
 import config
 from data_fetcher import get_watchlist_prices, get_historical_data, get_market_regime
@@ -13,8 +14,9 @@ from paper_trader import PaperTrader
 from ai_strategy import analyze_watchlist, get_portfolio_advice
 from strategy import get_latest_signal
 from learner import log_trade, record_outcome, get_snapshot, generate_lessons, print_performance_report
-from predictor import predict, train_model
+from predictor import predict, train_model, should_retrain
 from logger import logger
+from persistence import read_json, write_json_atomic
 
 
 # IST offset from UTC
@@ -78,33 +80,99 @@ SCAN_POOL = [
 
 # Max watchlist size — keep it manageable for API quotas
 MAX_WATCHLIST = 20
+MIN_WATCHLIST = 10
+WATCHLIST_STATE_FILE = os.path.join(config.PROJECT_DIR, "watchlist_state.json")
+MAX_DAILY_DRAWDOWN_PCT = 3.5
+SYMBOL_COOLDOWN_MIN = 45
 
 
-def scan_trending_stocks() -> list[str]:
+def _trend_score(hist: pd.DataFrame) -> float | None:
+    """Score short-term trend quality using momentum, volume, and volatility."""
+    if hist.empty or len(hist) < 20:
+        return None
+
+    close = hist["Close"]
+    volume = hist["Volume"]
+    price = float(close.iloc[-1])
+    if price <= 0:
+        return None
+
+    ret_5d = float(((close.iloc[-1] - close.iloc[-6]) / close.iloc[-6]) * 100) if len(close) >= 6 else 0.0
+    ret_20d = float(((close.iloc[-1] - close.iloc[-20]) / close.iloc[-20]) * 100)
+    avg_vol = float(volume.tail(20).mean())
+    vol_ratio = float(volume.iloc[-1] / avg_vol) if avg_vol > 0 else 1.0
+    daily_ret = close.pct_change().dropna().tail(20)
+    vol_pct = float(daily_ret.std() * 100) if not daily_ret.empty else 0.0
+
+    # Reward momentum + participation, penalize unstable moves.
+    return (ret_5d * 1.4) + (ret_20d * 0.8) + ((vol_ratio - 1.0) * 6.0) - (vol_pct * 0.9)
+
+
+def _adjust_confidence(confidence: float, signal: str, ml: dict, ml_mature: bool, regime: str) -> tuple[float, bool]:
+    adjusted = confidence
+    ml_agrees = True
+
+    if ml and ml_mature:
+        ml_dir = ml.get("prediction", "")
+        ml_conf = float(ml.get("confidence", 0))
+        if signal == "BUY" and ml_dir == "DOWN" and ml_conf > 0.6:
+            adjusted *= 0.65
+            ml_agrees = False
+        elif signal == "SELL" and ml_dir == "UP" and ml_conf > 0.6:
+            adjusted *= 0.65
+            ml_agrees = False
+        elif signal == "BUY" and ml_dir == "UP":
+            adjusted = min(adjusted * 1.1, 1.0)
+    elif ml and not ml_mature:
+        ml_dir = ml.get("prediction", "?")
+        ml_agrees = (signal == "BUY" and ml_dir == "UP") or (signal == "SELL" and ml_dir == "DOWN")
+
+    if regime == "BEAR" and signal == "BUY":
+        adjusted *= 0.9
+    elif regime == "BULL" and signal == "BUY":
+        adjusted = min(adjusted * 1.05, 1.0)
+
+    return max(0.0, min(adjusted, 1.0)), ml_agrees
+
+
+def _sized_position_pct(ai_size_pct: float, adjusted_conf: float, regime: str) -> float:
+    # Let AI drive sizing, but add confidence/regime caps for capital preservation.
+    conf_cap = 0.25 if adjusted_conf < 0.7 else 0.4 if adjusted_conf < 0.8 else 0.6
+    regime_cap = 0.3 if regime == "BEAR" else 0.8
+    return max(0.01, min(ai_size_pct, conf_cap, regime_cap))
+
+
+def scan_trending_stocks(held_symbols: set[str] | None = None, cycle_num: int = 0) -> list[str]:
     """Scan NSE stocks for trending movers. Returns list of symbols to add."""
+    if held_symbols is None:
+        held_symbols = set()
+
     logger.info("  [SCAN] Scanning NSE for trending stocks...")
+    state = read_json(WATCHLIST_STATE_FILE, default={})
+    held_cycles = state.get("hold_cycles", {})
     results = []
     for sym in SCAN_POOL:
         try:
             t = yf.Ticker(sym)
-            hist = t.history(period="5d")
-            if hist.empty or len(hist) < 2:
+            hist = t.history(period="30d")
+            score = _trend_score(hist)
+            if score is None:
                 continue
-            price = hist["Close"].iloc[-1]
-            prev = hist["Close"].iloc[-2]
-            chg = ((price - prev) / prev) * 100
-            vol = hist["Volume"].iloc[-1]
-            avg_vol = hist["Volume"].mean()
+            price = float(hist["Close"].iloc[-1])
+            prev = float(hist["Close"].iloc[-2])
+            chg = float(((price - prev) / prev) * 100) if prev > 0 else 0.0
+            vol = float(hist["Volume"].iloc[-1])
+            avg_vol = float(hist["Volume"].tail(20).mean())
             vol_ratio = vol / avg_vol if avg_vol > 0 else 1
             # Filter: affordable + trending
             max_price = config.INITIAL_CAPITAL * config.MAX_POSITION_SIZE_PCT
-            if price <= max_price and (chg > 3 or (chg > 1.5 and vol_ratio > 1.3)):
+            if price <= max_price and score > 2.0 and vol > 0:
                 results.append({
                     "sym": sym, "price": price, "chg": chg,
-                    "vol_ratio": vol_ratio, "score": chg + (vol_ratio - 1) * 2,
+                    "vol_ratio": vol_ratio, "score": score,
                 })
         except Exception:
-            pass
+            logger.warning(f"  [SCAN] Skipping {sym}: data fetch failed")
 
     # Sort by score (change % + volume bonus)
     results.sort(key=lambda x: x["score"], reverse=True)
@@ -113,14 +181,16 @@ def scan_trending_stocks() -> list[str]:
     current = set(config.WATCHLIST)
     added = []
     for r in results:
+        if r["sym"] in held_symbols:
+            continue
         if r["sym"] not in current and len(current) < MAX_WATCHLIST:
             current.add(r["sym"])
             added.append(r["sym"])
+            held_cycles[r["sym"]] = cycle_num
             logger.info(f"  [SCAN] + {r['sym']}: Rs.{r['price']:.2f} ({r['chg']:+.1f}%, vol:{r['vol_ratio']:.1f}x)")
 
     # Remove stocks that have gone cold (change < -2% and not in positions)
     cold = []
-    held_symbols = set()  # Will be updated with actual positions in the caller
     for sym in list(current):
         if sym in SCAN_POOL:
             try:
@@ -130,23 +200,35 @@ def scan_trending_stocks() -> list[str]:
                     price = hist["Close"].iloc[-1]
                     prev = hist["Close"].iloc[-2]
                     chg = ((price - prev) / prev) * 100
-                    if chg < -3 and sym not in held_symbols:
+                    hold_since = int(held_cycles.get(sym, cycle_num))
+                    cycles_held = max(0, cycle_num - hold_since)
+                    if chg < -3 and sym not in held_symbols and cycles_held >= 3:
                         cold.append(sym)
             except Exception:
-                pass
+                logger.warning(f"  [SCAN] Could not re-evaluate {sym} for removal")
 
     for sym in cold:
-        if len(current) > 10:  # Keep at least 10 stocks
+        if len(current) > MIN_WATCHLIST:  # Keep at least minimum basket breadth
             current.discard(sym)
+            held_cycles.pop(sym, None)
             logger.info(f"  [SCAN] - {sym}: removed (cold)")
 
     config.WATCHLIST = list(current)
+    write_json_atomic(WATCHLIST_STATE_FILE, {"hold_cycles": held_cycles, "updated_at": now_ist().isoformat()})
     logger.info(f"  [SCAN] Watchlist: {len(config.WATCHLIST)} stocks")
     return added
 
 
-def run_trading_cycle(trader: PaperTrader, cycle_num: int, use_ai: bool = True) -> None:
+def run_trading_cycle(
+    trader: PaperTrader,
+    cycle_num: int,
+    use_ai: bool = True,
+    allow_new_entries: bool = True,
+    symbol_cooldown: dict[str, datetime] | None = None,
+) -> None:
     """Run a single trading cycle."""
+    if symbol_cooldown is None:
+        symbol_cooldown = {}
     ist = now_ist()
     logger.info(f"\n{'='*60}")
     logger.info(f"  CYCLE #{cycle_num} | {ist.strftime('%Y-%m-%d %H:%M:%S')} IST")
@@ -191,12 +273,10 @@ def run_trading_cycle(trader: PaperTrader, cycle_num: int, use_ai: bool = True) 
 
         # Market Regime Check
         regime = get_market_regime()
-        original_max_position = config.MAX_POSITION_SIZE_PCT
         confidence_threshold = 0.6
         if regime == "BEAR":
-            logger.warning(f"  [REGIME] BEAR Market detected ({config.MARKET_INDEX} below 200-day SMA). Halving position sizes and increasing confidence threshold.")
-            config.MAX_POSITION_SIZE_PCT = original_max_position / 2
-            confidence_threshold = 0.8
+            logger.warning(f"  [REGIME] BEAR Market detected ({config.MARKET_INDEX} below 200-day SMA). AI sizing enabled, confidence threshold raised.")
+            confidence_threshold = 0.75
         elif regime == "BULL":
             logger.info(f"  [REGIME] BULL Market detected ({config.MARKET_INDEX} above 50-day & 200-day SMA). Normal trading rules apply.")
         else:
@@ -211,21 +291,7 @@ def run_trading_cycle(trader: PaperTrader, cycle_num: int, use_ai: bool = True) 
 
             # Cross-validate with ML model — only if mature
             ml = ml_predictions.get(symbol, {})
-            ml_agrees = True
-            if ml and ml_mature:
-                ml_dir = ml.get("prediction", "")
-                if signal == "BUY" and ml_dir == "DOWN" and ml.get("confidence", 0) > 0.6:
-                    confidence *= 0.7  # reduce confidence if ML disagrees
-                    ml_agrees = False
-                elif signal == "SELL" and ml_dir == "UP" and ml.get("confidence", 0) > 0.6:
-                    confidence *= 0.7
-                    ml_agrees = False
-                elif signal == "BUY" and ml_dir == "UP":
-                    confidence = min(confidence * 1.1, 1.0)  # boost if both agree
-            elif ml and not ml_mature:
-                # Log ML prediction for tracking but don't influence trades
-                ml_dir = ml.get("prediction", "?")
-                ml_agrees = (signal == "BUY" and ml_dir == "UP") or (signal == "SELL" and ml_dir == "DOWN")
+            confidence, ml_agrees = _adjust_confidence(confidence, signal, ml, ml_mature, regime)
 
             if confidence < confidence_threshold:
                 continue
@@ -236,10 +302,23 @@ def run_trading_cycle(trader: PaperTrader, cycle_num: int, use_ai: bool = True) 
             ml_tag = f"ML:{ml.get('prediction','?')}" if not ml_mature else ("ML agrees" if ml_agrees else "ML disagrees")
 
             if signal == "BUY" and symbol not in trader.portfolio.positions:
+                if not allow_new_entries:
+                    continue
                 price = prices.get(symbol, sig.get("price", 0))
                 if price > 0:
+                    cooldown_ts = symbol_cooldown.get(symbol)
+                    if cooldown_ts and (now_ist() - cooldown_ts).total_seconds() < SYMBOL_COOLDOWN_MIN * 60:
+                        logger.info(f"  [RISK] Cooldown active for {symbol}; skipping re-entry")
+                        continue
+                    ai_size_pct = float(sig.get("position_size_pct", confidence))
+                    ai_size_pct = _sized_position_pct(max(0.01, min(ai_size_pct, 1.0)), confidence, regime)
                     logger.info(f"  [AI] {sig.get('reason', '')} ({ml_tag})")
-                    order = trader.buy(symbol, price, confidence=confidence)
+                    order = trader.buy(
+                        symbol,
+                        price,
+                        confidence=confidence,
+                        max_position_size_pct=ai_size_pct,
+                    )
                     if order:
                         log_trade(symbol, "BUY", price, order.quantity,
                                   ai_signal=sig, indicators=indicators,
@@ -254,13 +333,11 @@ def run_trading_cycle(trader: PaperTrader, cycle_num: int, use_ai: bool = True) 
                     logger.info(f"  [AI] {sig.get('reason', '')} ({ml_tag})")
                     order = trader.sell(symbol, price)
                     if order:
+                        symbol_cooldown[symbol] = now_ist()
                         log_trade(symbol, "SELL", price, order.quantity,
                                   ai_signal=sig, indicators=indicators,
                                   market_context={"ml_prediction": ml})
                         record_outcome(symbol, price, pnl, pnl_pct)
-
-        # Restore config
-        config.MAX_POSITION_SIZE_PCT = original_max_position
 
         # Step 4: Update lessons learned
         logger.info("  [4/4] Updating lessons...")
@@ -325,6 +402,9 @@ def run_autopilot(interval_min: int = 15, use_ai: bool = True, force: bool = Fal
     cycle = 0
     last_train_date = None
     SCAN_EVERY_N_CYCLES = 3  # Every 3 cycles = 45 min at 15-min interval
+    day_start_equity: float | None = None
+    day_ref: datetime.date | None = None
+    symbol_cooldown: dict[str, datetime] = {}
 
     while True:
         try:
@@ -344,11 +424,20 @@ def run_autopilot(interval_min: int = 15, use_ai: bool = True, force: bool = Fal
             if use_ai and last_train_date != today:
                 logger.info(f"\n  [ML] Daily model re-training...")
                 try:
-                    metrics = train_model()
-                    if "error" not in metrics:
-                        logger.info(f"  [ML] Trained on {metrics['samples']} samples, accuracy: {metrics['cv_accuracy']}%")
+                    do_train, reason = should_retrain(min_hours=18)
+                    if do_train:
+                        metrics = train_model()
+                        if "error" not in metrics:
+                            promoted = "PROMOTED" if metrics.get("model_promoted") else "NOT promoted"
+                            logger.info(
+                                f"  [ML] Trained on {metrics['samples']} samples, "
+                                f"WF F1: {metrics.get('walk_forward_f1', 0)}%, "
+                                f"Holdout F1: {metrics.get('holdout_f1', 0)}% ({promoted})"
+                            )
+                        else:
+                            logger.warning(f"  [ML] Training skipped: {metrics['error']}")
                     else:
-                        logger.warning(f"  [ML] Training skipped: {metrics['error']}")
+                        logger.info(f"  [ML] Retraining skipped: {reason}")
                 except Exception as e:
                     logger.error(f"  [ML] Training failed: {e}")
                 last_train_date = today
@@ -359,10 +448,31 @@ def run_autopilot(interval_min: int = 15, use_ai: bool = True, force: bool = Fal
             if cycle == 1 or cycle % SCAN_EVERY_N_CYCLES == 0:
                 try:
                     logger.info(f"  [SCAN] Watchlist update (cycle {cycle})...")
-                    scan_trending_stocks()
+                    scan_trending_stocks(held_symbols=set(trader.portfolio.positions.keys()), cycle_num=cycle)
                 except Exception as e:
                     logger.error(f"  [SCAN] Error: {e}")
-            run_trading_cycle(trader, cycle, use_ai=use_ai)
+            prices = get_watchlist_prices()
+            allow_new_entries = True
+            if prices:
+                if day_ref != today:
+                    day_ref = today
+                    day_start_equity = trader.get_summary(prices)["total_value"]
+                if day_start_equity:
+                    current_equity = trader.get_summary(prices)["total_value"]
+                    day_return_pct = ((current_equity - day_start_equity) / day_start_equity) * 100
+                    if day_return_pct <= -MAX_DAILY_DRAWDOWN_PCT:
+                        allow_new_entries = False
+                        logger.warning(
+                            f"  [RISK] Daily drawdown {day_return_pct:.2f}% <= -{MAX_DAILY_DRAWDOWN_PCT:.2f}%. "
+                            "Blocking new BUY entries for today."
+                        )
+            run_trading_cycle(
+                trader,
+                cycle,
+                use_ai=use_ai,
+                allow_new_entries=allow_new_entries,
+                symbol_cooldown=symbol_cooldown,
+            )
 
             # Show daily performance report every 10 cycles
             if cycle % 10 == 0:
@@ -385,6 +495,10 @@ def run_autopilot(interval_min: int = 15, use_ai: bool = True, force: bool = Fal
                 logger.info(f"  Trades: {summary['total_trades']}")
             print_performance_report()
             break
+        except Exception as e:
+            logger.error(f"  Unhandled autopilot error: {e}")
+            logger.info("  Sleeping 60s before retry...")
+            time.sleep(60)
 
 
 if __name__ == "__main__":

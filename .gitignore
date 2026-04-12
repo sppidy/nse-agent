@@ -16,6 +16,8 @@ trade_journal.json
 training_log.json
 lessons_learned.json
 yfinance.cache
+*.lock
+*.json.lock
 
 # Logs
 logs/

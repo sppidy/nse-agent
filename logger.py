@@ -1,7 +1,7 @@
 import logging
 import os
 import sys
-from logging.handlers import RotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler
 
 import config
 
@@ -25,10 +25,11 @@ def setup_logger(name="ai_trading_agent"):
     # Console Formatter (Keep it clean for chat.py UI)
     console_formatter = logging.Formatter("%(message)s")
 
-    # File Handler
-    file_handler = RotatingFileHandler(
-        LOG_FILE, maxBytes=5*1024*1024, backupCount=5
+    # File Handler — daily rotation at midnight, keep 30 days
+    file_handler = TimedRotatingFileHandler(
+        LOG_FILE, when="midnight", interval=1, backupCount=30, encoding="utf-8"
     )
+    file_handler.suffix = "%Y-%m-%d"  # trading_agent.log.2026-04-09
     file_handler.setFormatter(file_formatter)
     file_handler.setLevel(logging.INFO)
 

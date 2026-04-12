@@ -29,6 +29,7 @@ from data_fetcher import get_watchlist_prices, get_historical_data, get_live_pri
 from strategy import add_indicators
 from learner import get_learning_context, get_performance_stats
 from news_sentiment import fetch_all_news, format_news_for_ai
+from logger import logger
 
 load_dotenv()
 
@@ -45,8 +46,8 @@ _MODELS = [
 
 def _get_client():
     api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("Set GEMINI_API_KEY in .env")
+    if not api_key or api_key == "your_api_key_here":
+        raise ValueError("Set a valid GEMINI_API_KEY in .env")
     return genai.Client(api_key=api_key)
 
 
@@ -113,7 +114,7 @@ def _get_market_snapshot() -> str:
             ema = "B" if latest["ema_short"] > latest["ema_long"] else "X"
             lines.append(f"{symbol.replace('.NS','')}|{latest['Close']:.1f}|{chg:+.1f}%|RSI:{latest['rsi']:.0f}|EMA:{ema}")
         except Exception:
-            pass
+            logger.warning(f"Market snapshot skipped for {symbol}: data fetch/indicator error")
     return "\n".join(lines) if lines else "No data."
 
 
@@ -293,6 +294,7 @@ def chat():
             news_data = fetch_all_news()
             news_text = format_news_for_ai(news_data)
         except Exception:
+            logger.warning("News fetch failed during startup; using fallback text.")
             news_text = "News data unavailable."
 
     trader = pdata["trader"]
@@ -308,8 +310,8 @@ def chat():
     if stats and stats.get("total_trades", 0) > 0:
         stats_text = (
             f"\nPERFORMANCE: Win Rate {stats.get('win_rate', 0):.0f}%, "
-            f"Avg Win Rs.{stats.get('avg_win', 0):.2f}, "
-            f"Avg Loss Rs.{stats.get('avg_loss', 0):.2f}"
+            f"Avg Win Rs.{stats.get('avg_win_pct', 0):.2f}%, "
+            f"Avg Loss Rs.{stats.get('avg_loss_pct', 0):.2f}%"
         )
 
     portfolio_text = _get_portfolio_text(trader, prices, summary)
@@ -368,7 +370,7 @@ def chat():
                     news_data = fetch_all_news()
                     news_text = format_news_for_ai(news_data)
                 except Exception:
-                    pass
+                    logger.warning("News refresh failed; keeping previously fetched news context.")
             console.print("[green]Data refreshed![/green]\n")
             continue
 

@@ -3,11 +3,13 @@
 import os
 import json
 import time
+import re
 from google import genai
 import pandas as pd
 from dotenv import load_dotenv
 
 import config
+from logger import logger
 from strategy import add_indicators
 
 load_dotenv()
@@ -24,6 +26,51 @@ _MODELS = [
     "gemini-3.1-flash-lite-preview",  # 500 RPD, 250K TPM (fallback)
     "gemma-4-26b-a4b-it",        # 1,500 RPD, unlimited TPM (last resort)
 ]
+
+
+def _sanitize_prompt_text(text: str, limit: int = 240) -> str:
+    cleaned = re.sub(r"https?://\S+", "", text or "")
+    cleaned = cleaned.replace("```", "")
+    cleaned = re.sub(r"(?i)(ignore\s+previous\s+instructions|system\s+prompt|developer\s+message)", "[filtered]", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:limit]
+
+
+def _normalize_signal_record(raw: dict, symbol: str, fallback_price: float) -> dict:
+    signal = str(raw.get("signal", "HOLD")).upper()
+    if signal not in {"BUY", "SELL", "HOLD"}:
+        signal = "HOLD"
+
+    try:
+        confidence = float(raw.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(confidence, 1.0))
+    try:
+        position_size_pct = float(raw.get("position_size_pct", confidence))
+    except (TypeError, ValueError):
+        position_size_pct = confidence
+    position_size_pct = max(0.01, min(position_size_pct, 1.0))
+
+    def _safe_num(v):
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "symbol": symbol,
+        "signal": signal,
+        "confidence": confidence,
+        "reason": _sanitize_prompt_text(str(raw.get("reason", "No explanation provided")), limit=280),
+        "entry_price": _safe_num(raw.get("entry_price")),
+        "stop_loss": _safe_num(raw.get("stop_loss")),
+        "target": _safe_num(raw.get("target")),
+        "position_size_pct": position_size_pct,
+        "price": float(fallback_price),
+    }
 
 
 def _get_client():
@@ -52,10 +99,10 @@ def _call_gemini(client, prompt: str, retries: int = _MAX_RETRIES) -> str:
                 if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
                     if attempt < retries - 1:
                         wait = _MIN_DELAY_BETWEEN_CALLS * (attempt + 2)
-                        print(f"    Rate limited on {model}, waiting {wait}s...")
+                        logger.warning(f"    Rate limited on {model}, waiting {wait}s...")
                         time.sleep(wait)
                     else:
-                        print(f"    {model} exhausted, trying next model...")
+                        logger.warning(f"    {model} exhausted, trying next model...")
                         break  # try next model
                 elif "404" in error_str or "NOT_FOUND" in error_str:
                     break  # model doesn't exist, try next
@@ -155,6 +202,7 @@ Respond ONLY with a valid JSON array (no markdown, no extra text). One object pe
     "symbol": "SYMBOL.NS",
     "signal": "BUY" or "SELL" or "HOLD",
     "confidence": 0.0 to 1.0,
+    "position_size_pct": 0.01 to 1.0,
     "reason": "brief explanation",
     "entry_price": number or null,
     "stop_loss": number or null,
@@ -169,18 +217,19 @@ Respond ONLY with a valid JSON array (no markdown, no extra text). One object pe
             text = text.rsplit("```", 1)[0]
         results = json.loads(text)
 
-        # Add price data back
+        # Strictly normalize model output to expected schema.
         price_map = {}
         for symbol, df in stock_data:
             if not df.empty:
                 price_map[symbol] = float(df["Close"].dropna().iloc[-1])
-        for r in results:
-            sym = r.get("symbol", "")
-            r["price"] = price_map.get(sym, 0)
-
-        return results
+        normalized = []
+        by_symbol = {item.get("symbol"): item for item in results if isinstance(item, dict)}
+        for sym, _df in stock_data:
+            raw = by_symbol.get(sym, {})
+            normalized.append(_normalize_signal_record(raw, sym, price_map.get(sym, 0.0)))
+        return normalized
     except Exception as e:
-        print(f"    Batch analysis failed: {e}")
+        logger.error(f"    Batch analysis failed: {e}")
         return [
             {
                 "symbol": sym,
@@ -209,6 +258,7 @@ Respond ONLY with valid JSON (no markdown, no extra text):
 {{
     "signal": "BUY" or "SELL" or "HOLD",
     "confidence": 0.0 to 1.0,
+    "position_size_pct": 0.01 to 1.0,
     "reason": "brief 1-2 sentence explanation",
     "entry_price": suggested entry price or null,
     "stop_loss": suggested stop loss price or null,
@@ -221,9 +271,7 @@ Respond ONLY with valid JSON (no markdown, no extra text):
             text = text.split("\n", 1)[1]
             text = text.rsplit("```", 1)[0]
         result = json.loads(text)
-        result["symbol"] = symbol
-        result["price"] = float(df["Close"].dropna().iloc[-1])
-        return result
+        return _normalize_signal_record(result, symbol, float(df["Close"].dropna().iloc[-1]))
     except Exception as e:
         return {
             "symbol": symbol,
@@ -252,7 +300,7 @@ def analyze_watchlist(watchlist: list[str] | None = None) -> list[dict]:
         return []
 
     # Single API call for all stocks (saves quota!)
-    print(f"  Sending {len(stock_data)} stocks to Gemini in one batch...")
+    logger.info(f"  Sending {len(stock_data)} stocks to Gemini in one batch...")
     return analyze_batch(stock_data)
 
 
@@ -273,10 +321,10 @@ async def _call_gemini_async(client, prompt: str, retries: int = _MAX_RETRIES) -
                 if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
                     if attempt < retries - 1:
                         wait = _MIN_DELAY_BETWEEN_CALLS * (attempt + 2)
-                        print(f"    Rate limited on {model}, waiting {wait}s...")
+                        logger.warning(f"    Rate limited on {model}, waiting {wait}s...")
                         await asyncio.sleep(wait)
                     else:
-                        print(f"    {model} exhausted, trying next model...")
+                        logger.warning(f"    {model} exhausted, trying next model...")
                         break
                 elif "404" in error_str or "NOT_FOUND" in error_str:
                     break
@@ -325,6 +373,7 @@ Respond ONLY with a valid JSON array (no markdown, no extra text). One object pe
     "symbol": "SYMBOL.NS",
     "signal": "BUY" or "SELL" or "HOLD",
     "confidence": 0.0 to 1.0,
+    "position_size_pct": 0.01 to 1.0,
     "reason": "brief explanation",
     "entry_price": number or null,
     "stop_loss": number or null,
@@ -343,13 +392,14 @@ Respond ONLY with a valid JSON array (no markdown, no extra text). One object pe
         for symbol, df in stock_data:
             if not df.empty:
                 price_map[symbol] = float(df["Close"].dropna().iloc[-1])
-        for r in results:
-            sym = r.get("symbol", "")
-            r["price"] = price_map.get(sym, 0)
-
-        return results
+        normalized = []
+        by_symbol = {item.get("symbol"): item for item in results if isinstance(item, dict)}
+        for sym, _df in stock_data:
+            raw = by_symbol.get(sym, {})
+            normalized.append(_normalize_signal_record(raw, sym, price_map.get(sym, 0.0)))
+        return normalized
     except Exception as e:
-        print(f"    Batch analysis failed: {e}")
+        logger.error(f"    Batch analysis failed: {e}")
         return [
             {
                 "symbol": sym,
@@ -381,7 +431,7 @@ async def analyze_watchlist_async(watchlist: list[str] | None = None) -> list[di
     if not stock_data:
         return []
 
-    print(f"  Sending {len(stock_data)} stocks to Gemini in one batch (async)...")
+    logger.info(f"  Sending {len(stock_data)} stocks to Gemini in one batch (async)...")
     return await analyze_batch_async(stock_data)
 
 def get_portfolio_advice(portfolio_summary: dict, signals: list[dict]) -> str:
