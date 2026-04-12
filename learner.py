@@ -6,14 +6,13 @@ market conditions). Before making new trades, we feed this history to Gemini
 so it can learn what worked and what didn't.
 """
 
-import json
 import os
 from datetime import datetime
-from pathlib import Path
 
 import pandas as pd
 
 import config
+from persistence import read_json, write_json_atomic
 from strategy import add_indicators
 
 JOURNAL_FILE = os.path.join(config.PROJECT_DIR, "trade_journal.json")
@@ -21,15 +20,11 @@ LESSONS_FILE = os.path.join(config.PROJECT_DIR, "lessons_learned.json")
 
 
 def _load_json(filepath: str) -> list:
-    if not os.path.exists(filepath):
-        return []
-    with open(filepath) as f:
-        return json.load(f)
+    return read_json(filepath, default=[])
 
 
 def _save_json(filepath: str, data: list):
-    with open(filepath, "w") as f:
-        json.dump(data, f, indent=2)
+    write_json_atomic(filepath, data)
 
 
 # ── Trade Journal ──────────────────────────────────────────────
