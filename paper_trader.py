@@ -2,6 +2,7 @@
 
 import os
 import random
+import math
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -76,9 +77,21 @@ class Portfolio:
     trade_log: list[dict] = field(default_factory=list)
     total_realized_pnl: float = 0.0
 
+    @staticmethod
+    def _safe_price(value: float | None, fallback: float) -> float:
+        if value is None:
+            return fallback
+        try:
+            price = float(value)
+        except (TypeError, ValueError):
+            return fallback
+        if not math.isfinite(price) or price <= 0:
+            return fallback
+        return price
+
     def total_value(self, prices: dict[str, float]) -> float:
         positions_value = sum(
-            pos.current_value(prices.get(sym, pos.avg_price))
+            pos.current_value(self._safe_price(prices.get(sym), pos.avg_price))
             for sym, pos in self.positions.items()
         )
         return self.cash + positions_value
