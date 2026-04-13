@@ -247,6 +247,7 @@ def run_trading_cycle(
         return
 
     # Check stop-loss / take-profit first
+    trader.refresh_portfolio()
     triggered = trader.check_stop_loss_take_profit(prices)
     if triggered:
         logger.info(f"  Triggered {len(triggered)} stop-loss/take-profit orders")
@@ -291,6 +292,7 @@ def run_trading_cycle(
         # Step 3: Combine AI + ML and execute trades
         logger.info("  [3/4] Executing trades...")
         for sig in signals:
+            trader.refresh_portfolio()
             symbol = sig["symbol"]
             signal = sig.get("signal", "HOLD")
             confidence = sig.get("confidence", 0)
@@ -324,6 +326,7 @@ def run_trading_cycle(
                         price,
                         confidence=confidence,
                         max_position_size_pct=ai_size_pct,
+                        ai_signal=sig,
                     )
                     if order:
                         log_trade(symbol, "BUY", price, order.quantity,
@@ -351,6 +354,7 @@ def run_trading_cycle(
     else:
         # Rule-based signals (no API calls)
         for symbol in config.WATCHLIST:
+            trader.refresh_portfolio()
             df = get_historical_data(symbol, period="30d", interval="1d")
             if df.empty:
                 continue
