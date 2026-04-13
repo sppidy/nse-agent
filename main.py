@@ -51,12 +51,14 @@ def cmd_ai_trade():
         return
 
     # Check stop-loss / take-profit first
+    trader.refresh_portfolio()
     trader.check_stop_loss_take_profit(prices)
 
     # Get AI signals
     signals = analyze_watchlist()
 
     for sig in signals:
+        trader.refresh_portfolio()
         symbol = sig["symbol"]
         signal = sig.get("signal", "HOLD")
         confidence = sig.get("confidence", 0)
@@ -69,7 +71,13 @@ def cmd_ai_trade():
             price = prices.get(symbol, sig.get("price", 0))
             if price > 0:
                 print(f"  [AI] {sig.get('reason', '')}")
-                trader.buy(symbol, price)
+                trader.buy(
+                    symbol,
+                    price,
+                    confidence=confidence,
+                    max_position_size_pct=float(sig.get("position_size_pct", confidence or config.MAX_POSITION_SIZE_PCT)),
+                    ai_signal=sig,
+                )
 
         elif signal == "SELL" and symbol in trader.portfolio.positions:
             price = prices.get(symbol, sig.get("price", 0))
@@ -153,10 +161,12 @@ def cmd_trade():
         return
 
     # Check stop-loss / take-profit on existing positions
+    trader.refresh_portfolio()
     trader.check_stop_loss_take_profit(prices)
 
     # Scan for signals
     for symbol in config.WATCHLIST:
+        trader.refresh_portfolio()
         df = get_historical_data(symbol, period="30d", interval="1d")
         if df.empty:
             continue

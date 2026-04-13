@@ -1,5 +1,6 @@
 # AI Trading Agent
 
+
 Paper-trading assistant for NSE stocks with:
 - rule-based strategy (RSI/EMA),
 - Gemini-assisted signal generation,

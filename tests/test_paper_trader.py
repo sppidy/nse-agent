@@ -8,6 +8,56 @@ from paper_trader import PaperTrader, Portfolio, Position
 
 
 class TestPaperTrader(unittest.TestCase):
+    def test_buy_refreshes_portfolio_from_disk_before_save(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = f"{tmp}\\portfolio.json"
+            Portfolio(cash=10000.0).save(path)
+            trader = PaperTrader(filepath=path)
+
+            with patch("paper_trader.is_market_trading_day", return_value=True), patch("paper_trader.random.uniform", return_value=1.0):
+                trader.buy("AAA.NS", price=100.0, quantity=10)
+
+            external = Portfolio.load(path)
+            external.positions["MANUAL.NS"] = Position(
+                symbol="MANUAL.NS",
+                quantity=5,
+                avg_price=50.0,
+                entry_time="2026-01-01T00:00:00",
+            )
+            external.save(path)
+
+            with patch("paper_trader.is_market_trading_day", return_value=True), patch("paper_trader.random.uniform", return_value=1.0):
+                trader.buy("BBB.NS", price=100.0, quantity=10)
+
+            final_data = Portfolio.load(path)
+            self.assertIn("MANUAL.NS", final_data.positions)
+            self.assertIn("AAA.NS", final_data.positions)
+            self.assertIn("BBB.NS", final_data.positions)
+
+    def test_buy_applies_ai_risk_targets_to_position(self):
+        trader = PaperTrader(portfolio=Portfolio(cash=10000.0))
+        ai_signal = {"stop_loss": 95.0, "target": 120.0}
+        with patch("paper_trader.is_market_trading_day", return_value=True), patch("paper_trader.random.uniform", return_value=1.0):
+            trader.buy("TEST.NS", price=100.0, quantity=10, confidence=0.8, ai_signal=ai_signal)
+
+        pos = trader.portfolio.positions["TEST.NS"]
+        self.assertAlmostEqual(95.0, pos.ai_stop_loss)
+        self.assertAlmostEqual(120.0, pos.ai_target)
+        self.assertGreater(pos.dynamic_take_profit_pct, config.TAKE_PROFIT_PCT)
+        self.assertGreaterEqual(pos.dynamic_stop_loss_pct, config.MIN_STOP_LOSS_PCT)
+
+    def test_buy_uses_capital_utilization_floor_for_low_confidence(self):
+        original_initial = config.INITIAL_CAPITAL
+        try:
+            config.INITIAL_CAPITAL = 10000.0
+            trader = PaperTrader(portfolio=Portfolio(cash=10000.0))
+            with patch("paper_trader.is_market_trading_day", return_value=True), patch("paper_trader.random.uniform", return_value=1.0):
+                order = trader.buy("UTIL.NS", price=100.0, confidence=0.2, max_position_size_pct=0.10)
+            self.assertIsNotNone(order)
+            self.assertGreaterEqual(order.quantity, 4)
+        finally:
+            config.INITIAL_CAPITAL = original_initial
+
     def test_buy_respects_explicit_max_position_size_pct(self):
         original_initial = config.INITIAL_CAPITAL
         try:
