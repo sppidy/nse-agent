@@ -1,9 +1,10 @@
 import tempfile
 import unittest
+import math
 from unittest.mock import patch
 
 import config
-from paper_trader import PaperTrader, Portfolio
+from paper_trader import PaperTrader, Portfolio, Position
 
 
 class TestPaperTrader(unittest.TestCase):
@@ -39,6 +40,16 @@ class TestPaperTrader(unittest.TestCase):
         self.assertIsNone(buy_order)
         self.assertIsNone(sell_order)
         self.assertEqual([], triggered)
+
+    def test_get_summary_ignores_nan_prices(self):
+        portfolio = Portfolio(
+            cash=1000.0,
+            positions={"TEST.NS": Position(symbol="TEST.NS", quantity=2, avg_price=100.0, entry_time="2026-01-01T00:00:00")},
+        )
+        trader = PaperTrader(portfolio=portfolio)
+        summary = trader.get_summary({"TEST.NS": float("nan")})
+        self.assertTrue(math.isfinite(summary["total_value"]))
+        self.assertEqual(1200.0, summary["total_value"])
 
 
 if __name__ == "__main__":

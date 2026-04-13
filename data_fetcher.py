@@ -1,11 +1,22 @@
 """Fetch market data for Indian stocks using yfinance."""
 
+import math
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
 import config
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from logger import logger
+
+
+def _clean_price(value) -> float | None:
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(price) or price <= 0:
+        return None
+    return price
 
 @retry(
     stop=stop_after_attempt(3),
@@ -60,13 +71,13 @@ def get_live_price(symbol: str) -> float | None:
     try:
         ticker = yf.Ticker(symbol)
         info = ticker.fast_info
-        try:
-            return float(info["lastPrice"])
-        except (KeyError, TypeError):
-            hist = ticker.history(period="1d")
-            if not hist.empty:
-                return float(hist["Close"].iloc[-1])
-            return None
+        live = _clean_price(info.get("lastPrice") if info is not None else None)
+        if live is not None:
+            return live
+        hist = ticker.history(period="1d")
+        if not hist.empty:
+            return _clean_price(hist["Close"].iloc[-1])
+        return None
     except Exception as e:
         logger.error(f"Error fetching live price for {symbol}: {e}")
         raise e

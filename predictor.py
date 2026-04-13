@@ -71,6 +71,21 @@ def should_retrain(min_hours: int = 18) -> tuple[bool, str]:
     return False, f"Only {elapsed_hours:.1f}h since last training"
 
 
+def _resolve_training_n_jobs() -> int:
+    """Resolve job count for model search; keep default conservative for stability."""
+    raw = os.environ.get("ML_TRAIN_N_JOBS", "1").strip()
+    try:
+        jobs = int(raw)
+    except ValueError:
+        logger.warning(f"Invalid ML_TRAIN_N_JOBS='{raw}', falling back to 1")
+        return 1
+
+    if jobs == 0 or jobs < -1:
+        logger.warning(f"Unsupported ML_TRAIN_N_JOBS='{raw}', falling back to 1")
+        return 1
+    return jobs
+
+
 def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
     """Create feature matrix from OHLCV data."""
     df = add_indicators(df).copy()
@@ -173,6 +188,7 @@ def train_model(symbols: list[str] | None = None, period: str = "1y") -> dict:
     }
     
     base_model = GradientBoostingClassifier(random_state=42)
+    search_jobs = _resolve_training_n_jobs()
     random_search = RandomizedSearchCV(
         estimator=base_model,
         param_distributions=param_dist,
@@ -180,10 +196,10 @@ def train_model(symbols: list[str] | None = None, period: str = "1y") -> dict:
         cv=tscv,
         scoring='f1',
         random_state=42,
-        n_jobs=-1
+        n_jobs=search_jobs
     )
     
-    logger.info("  Tuning hyperparameters...")
+    logger.info(f"  Tuning hyperparameters... (n_jobs={search_jobs})")
     random_search.fit(X, y)
     
     final_model = random_search.best_estimator_
