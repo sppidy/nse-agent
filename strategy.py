@@ -83,3 +83,133 @@ def get_latest_signal(symbol: str, df: pd.DataFrame) -> dict:
         "rsi": round(last["rsi"], 1) if not pd.isna(last.get("rsi")) else None,
         "reason": ", ".join(reason_parts),
     }
+
+
+def get_scored_signal(symbol: str, df: pd.DataFrame) -> dict:
+    """Multi-indicator scored signal for rule-based trading.
+
+    Scores each indicator independently and combines them into a confidence
+    value. Requires agreement from multiple indicators before emitting a
+    BUY or SELL — much more selective than the simple crossover signal.
+
+    Returns dict with: symbol, signal, confidence, price, reason, indicators.
+    """
+    df = add_indicators(df)
+    if df.empty or len(df) < 5:
+        return {"symbol": symbol, "signal": "HOLD", "confidence": 0, "reason": "Insufficient data"}
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    price = last["Close"]
+    reasons = []
+    buy_score = 0
+    sell_score = 0
+
+    # ── 1. RSI (weight: 2) ──
+    rsi = last.get("rsi")
+    if pd.notna(rsi):
+        if rsi < config.RSI_OVERSOLD:
+            buy_score += 2
+            reasons.append(f"RSI oversold ({rsi:.0f})")
+        elif rsi < 45:
+            buy_score += 1
+            reasons.append(f"RSI low ({rsi:.0f})")
+        elif rsi > 80:
+            sell_score += 2
+            reasons.append(f"RSI extreme ({rsi:.0f})")
+        elif rsi > config.RSI_OVERBOUGHT:
+            sell_score += 1
+            reasons.append(f"RSI overbought ({rsi:.0f})")
+
+    # ── 2. EMA crossover (weight: 2) ──
+    ema_s, ema_l = last.get("ema_short"), last.get("ema_long")
+    prev_ema_s, prev_ema_l = prev.get("ema_short"), prev.get("ema_long")
+    if pd.notna(ema_s) and pd.notna(ema_l) and pd.notna(prev_ema_s) and pd.notna(prev_ema_l):
+        if prev_ema_s <= prev_ema_l and ema_s > ema_l:
+            buy_score += 2
+            reasons.append("EMA bullish crossover")
+        elif ema_s > ema_l:
+            buy_score += 1
+        if prev_ema_s >= prev_ema_l and ema_s < ema_l:
+            sell_score += 2
+            reasons.append("EMA bearish crossover")
+        elif ema_s < ema_l:
+            sell_score += 1
+
+    # ── 3. MACD (weight: 2) ──
+    macd_diff = last.get("macd_diff")
+    prev_macd_diff = prev.get("macd_diff")
+    if pd.notna(macd_diff) and pd.notna(prev_macd_diff):
+        if prev_macd_diff <= 0 < macd_diff:
+            buy_score += 2
+            reasons.append("MACD bullish cross")
+        elif macd_diff > 0:
+            buy_score += 1
+        if prev_macd_diff >= 0 > macd_diff:
+            sell_score += 2
+            reasons.append("MACD bearish cross")
+        elif macd_diff < 0:
+            sell_score += 1
+
+    # ── 4. Bollinger Bands (weight: 1) ──
+    bb_low = last.get("bb_low")
+    bb_high = last.get("bb_high")
+    if pd.notna(bb_low) and pd.notna(bb_high):
+        if price <= bb_low:
+            buy_score += 1
+            reasons.append("Price at lower BB")
+        elif price >= bb_high:
+            sell_score += 1
+            reasons.append("Price at upper BB")
+
+    # ── 5. Volume confirmation (weight: 1) ──
+    vol_sma = last.get("volume_sma")
+    if pd.notna(vol_sma) and vol_sma > 0:
+        vol_ratio = last["Volume"] / vol_sma
+        if vol_ratio > 1.5:
+            # Volume confirms whichever direction is winning
+            if buy_score > sell_score:
+                buy_score += 1
+                reasons.append(f"Vol {vol_ratio:.1f}x avg")
+            elif sell_score > buy_score:
+                sell_score += 1
+                reasons.append(f"Vol {vol_ratio:.1f}x avg")
+
+    # ── 6. Trend consistency — 5-day close direction (weight: 1) ──
+    if len(df) >= 5:
+        closes_5d = df["Close"].tail(5)
+        up_days = (closes_5d.diff().dropna() > 0).sum()
+        if up_days >= 4:
+            buy_score += 1
+            reasons.append(f"{up_days}/4 up days")
+        elif up_days <= 1:
+            sell_score += 1
+            reasons.append(f"{4 - up_days}/4 down days")
+
+    # ── Combine scores ──
+    max_possible = 9  # 2+2+2+1+1+1
+    # Require 3+ score with clear directional edge (score gap >= 2)
+    if buy_score >= 3 and buy_score >= sell_score + 2:
+        confidence = round(min(buy_score / max_possible + 0.3, 0.85), 2)
+        signal = "BUY"
+    elif sell_score >= 3 and sell_score >= buy_score + 2:
+        confidence = round(min(sell_score / max_possible + 0.3, 0.85), 2)
+        signal = "SELL"
+    else:
+        confidence = 0
+        signal = "HOLD"
+
+    return {
+        "symbol": symbol,
+        "signal": signal,
+        "confidence": confidence,
+        "price": round(float(price), 2),
+        "reason": ", ".join(reasons) if reasons else "No strong signals",
+        "buy_score": buy_score,
+        "sell_score": sell_score,
+        "indicators": {
+            "rsi": round(float(rsi), 1) if pd.notna(rsi) else None,
+            "ema_trend": "bullish" if (pd.notna(ema_s) and pd.notna(ema_l) and ema_s > ema_l) else "bearish",
+            "macd_diff": round(float(macd_diff), 3) if pd.notna(macd_diff) else None,
+        },
+    }
