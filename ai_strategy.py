@@ -171,13 +171,13 @@ def _prepare_stock_summary(symbol: str, df: pd.DataFrame) -> str:
 
     price = latest["Close"]
     prev_close = prev["Close"]
-    change_pct = ((price - prev_close) / prev_close) * 100
+    change_pct = ((price - prev_close) / prev_close) * 100 if prev_close != 0 else 0
     high_5d = recent["High"].max()
     low_5d = recent["Low"].min()
 
     if len(df) >= 20:
         price_20d_ago = df.iloc[-20]["Close"]
-        trend_20d = ((price - price_20d_ago) / price_20d_ago) * 100
+        trend_20d = ((price - price_20d_ago) / price_20d_ago) * 100 if price_20d_ago != 0 else 0
     else:
         trend_20d = 0
 
@@ -201,7 +201,7 @@ def _prepare_stock_summary(symbol: str, df: pd.DataFrame) -> str:
 
     summary += "Last 5 days: "
     for idx, row in recent.tail(5).iterrows():
-        day_change = ((row["Close"] - row["Open"]) / row["Open"]) * 100
+        day_change = ((row["Close"] - row["Open"]) / row["Open"]) * 100 if row["Open"] != 0 else 0
         summary += f"{row['Close']:.2f}({day_change:+.1f}%) "
 
     return summary

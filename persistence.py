@@ -2,6 +2,7 @@
 
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Any
 from sqlalchemy import create_engine, Column, String, Text
@@ -20,6 +21,7 @@ DB_PATH = os.path.join(config.PROJECT_DIR, "trading_agent.db")
 engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
 Base.metadata.create_all(engine)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+_db_lock = threading.Lock()
 
 def _keys_for_path(path: str | Path) -> tuple[str, str]:
     path_obj = Path(path)
@@ -29,7 +31,7 @@ def _keys_for_path(path: str | Path) -> tuple[str, str]:
 
 def read_json(path: str | Path, default: Any = None) -> Any:
     key, legacy_key = _keys_for_path(path)
-    with SessionLocal() as db:
+    with _db_lock, SessionLocal() as db:
         for candidate in (key, legacy_key):
             item = db.query(StoreItem).filter(StoreItem.key == candidate).first()
             if item and item.value:
@@ -42,7 +44,7 @@ def read_json(path: str | Path, default: Any = None) -> Any:
 def write_json_atomic(path: str | Path, data: Any) -> None:
     key, legacy_key = _keys_for_path(path)
     value = json.dumps(data, indent=2)
-    with SessionLocal() as db:
+    with _db_lock, SessionLocal() as db:
         item = db.query(StoreItem).filter(StoreItem.key == key).first()
         if item:
             item.value = value
