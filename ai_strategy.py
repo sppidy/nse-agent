@@ -25,8 +25,8 @@ _MAX_RETRIES = 3
 _MODELS = [
     "gemma-4-31b-it",
     "gemma-4-26b-a4b-it",
-    "gemini-3-flash",
-    "gemini-3.1-flash-lite-preview",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
 ]
 
 class SignalSchema(BaseModel):
@@ -117,7 +117,44 @@ async def _call_gemini_async(client, prompt: str, retries: int = _MAX_RETRIES, r
                     **kwargs
                 )
                 if response_schema:
-                    return response.parsed
+                    parsed = response.parsed
+                    if parsed is not None:
+                        return parsed
+                    # response.parsed failed — try manual JSON parse of raw text
+                    raw_text = (response.text or "").strip()
+                    logger.warning(f"    {model}: response.parsed is None, trying manual JSON parse (text length={len(raw_text)})")
+                    if raw_text:
+                        import json as _json
+                        # Strip markdown code fences if present
+                        clean = raw_text
+                        if clean.startswith("```"):
+                            clean = re.sub(r"^```(?:json)?\s*\n?", "", clean)
+                            clean = re.sub(r"\n?```\s*$", "", clean)
+                            clean = clean.strip()
+                        # Gemini sometimes appends extra data after the JSON array
+                        # Find the last ] and truncate
+                        if clean.startswith("["):
+                            last_bracket = clean.rfind("]")
+                            if last_bracket > 0:
+                                clean = clean[:last_bracket + 1]
+                        try:
+                            raw_json = _json.loads(clean)
+                            if isinstance(raw_json, list):
+                                results = []
+                                for item in raw_json:
+                                    try:
+                                        results.append(SignalSchema(**(item if isinstance(item, dict) else {})))
+                                    except Exception:
+                                        pass
+                                if results:
+                                    logger.info(f"    Manual JSON parse recovered {len(results)} signals")
+                                    return results
+                        except _json.JSONDecodeError as je:
+                            logger.warning(f"    Manual JSON parse failed at char {je.pos}: {je.msg}")
+                            logger.warning(f"    Raw starts: {clean[:200]}")
+                            logger.warning(f"    Raw ends: {clean[-200:]}")
+                    # Don't raise — continue to next model
+                    continue
                 return response.text.strip()
             except Exception as e:
                 error_str = str(e)
@@ -243,7 +280,9 @@ async def analyze_batch_async(stock_data: list[tuple[str, pd.DataFrame]]) -> lis
             for sym, _ in stock_data
         ]
 
-    prompt = f"""You are a quantitative trading analyst that learns from past performance and reads market news.
+    symbol_list = ", ".join(f'"{s}"' for s in symbols)
+
+    prompt = f"""You are a quantitative trading analyst for NSE Indian stocks. Analyze each stock and return trading signals.
 
 {learning}
 
@@ -254,22 +293,53 @@ STOCKS DATA:
 
 PORTFOLIO: Rs.{config.INITIAL_CAPITAL} capital, max {config.MAX_POSITION_SIZE_PCT*100}% per position, {config.STOP_LOSS_PCT*100}% stop loss, {config.TAKE_PROFIT_PCT*100}% take profit.
 
-IMPORTANT RULES:
+RULES:
 1. Use trade history to avoid repeating losing patterns and favor winning setups.
-2. NEWS SENTIMENT is critical — if news is bearish for a stock, lower confidence even if technicals look good. If news is very bullish, boost confidence.
-3. If overall market mood is BEARISH, be more cautious with all BUY signals.
-4. If a company has negative news (scandal, downgrade, earnings miss), signal SELL or HOLD regardless of technicals.
+2. NEWS SENTIMENT is critical — bearish news lowers confidence, bullish news boosts it.
+3. BEAR market = cautious BUY signals. Negative company news = SELL or HOLD.
+
+OUTPUT: Return a JSON array with exactly {len(symbols)} objects, one per stock.
+Each object MUST have these fields:
+- "symbol": string (use exact symbol including .NS suffix: {symbol_list})
+- "signal": "BUY" or "SELL" or "HOLD"
+- "confidence": number 0.0 to 1.0
+- "position_size_pct": number 0.01 to 1.0
+- "reason": string (brief explanation under 200 chars)
+- "entry_price": number or null
+- "stop_loss": number or null
+- "target": number or null
+
+Return ONLY the JSON array. No markdown, no explanation, no text before or after the JSON.
 """
 
     try:
         results = await _call_gemini_async(client, prompt, response_schema=list[SignalSchema])
-        
+
         normalized = []
         if results:
-            by_symbol = {item.symbol: item for item in results}
+            # Build lookup tolerant of Gemini stripping/adding .NS suffix
+            by_symbol: dict[str, SignalSchema] = {}
+            for item in results:
+                sym_name = item.symbol if isinstance(item, SignalSchema) else item.get("symbol", "")
+                by_symbol[sym_name] = item
+                by_symbol[sym_name.replace(".NS", "")] = item
+                if not sym_name.endswith(".NS"):
+                    by_symbol[sym_name + ".NS"] = item
             for sym, _df in stock_data:
-                raw = by_symbol.get(sym, {})
+                raw = by_symbol.get(sym, by_symbol.get(sym.replace(".NS", ""), {}))
                 normalized.append(_normalize_signal_record(raw, sym, price_map.get(sym, 0.0)))
+            logger.info(f"    Normalized {len(normalized)} signals from Gemini response")
+        else:
+            logger.error(f"    No signals could be extracted from Gemini for {len(stock_data)} stocks")
+            # Return HOLD signals so the app at least shows something
+            for sym, _df in stock_data:
+                normalized.append({
+                    "symbol": sym,
+                    "signal": "HOLD",
+                    "confidence": 0.0,
+                    "reason": "AI analysis returned empty response",
+                    "price": price_map.get(sym, 0.0),
+                })
         return normalized
     except Exception as e:
         logger.error(f"    Batch analysis failed: {e}")
@@ -292,11 +362,18 @@ async def analyze_watchlist_async(watchlist: list[str] | None = None) -> list[di
     if watchlist is None:
         watchlist = config.WATCHLIST
 
+    logger.info(f"  [AI-SCAN] Starting scan for {len(watchlist)} symbols...")
+
     async def fetch_one(symbol):
-        df = await asyncio.to_thread(get_historical_data, symbol, period="60d", interval="1d")
-        if not df.empty:
-            return (symbol, df)
-        return None
+        try:
+            df = await asyncio.to_thread(get_historical_data, symbol, period="60d", interval="1d")
+            if not df.empty:
+                return (symbol, df)
+            logger.warning(f"  [AI-SCAN] {symbol}: empty data from yfinance")
+            return None
+        except Exception as e:
+            logger.warning(f"  [AI-SCAN] {symbol}: fetch failed — {e}")
+            return None
 
     # Fetch data concurrently using asyncio.gather
     tasks = [fetch_one(sym) for sym in watchlist]
@@ -304,9 +381,10 @@ async def analyze_watchlist_async(watchlist: list[str] | None = None) -> list[di
     stock_data = [res for res in results if res is not None]
 
     if not stock_data:
+        logger.error(f"  [AI-SCAN] All {len(watchlist)} data fetches returned empty — cannot scan")
         return []
 
-    logger.info(f"  Sending {len(stock_data)} stocks to Gemini in one batch (async)...")
+    logger.info(f"  [AI-SCAN] Fetched {len(stock_data)}/{len(watchlist)} stocks, sending to Gemini...")
     return await analyze_batch_async(stock_data)
 
 def analyze_watchlist(watchlist: list[str] | None = None) -> list[dict]:
