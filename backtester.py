@@ -65,7 +65,7 @@ def backtest(symbol: str, df: pd.DataFrame, initial_capital: float = None) -> di
             position = 0
 
         # Stop loss / take profit
-        elif position > 0:
+        elif position > 0 and avg_price > 0:
             pnl_pct = (price - avg_price) / avg_price
             if pnl_pct <= -config.STOP_LOSS_PCT:
                 fill = price * (1 - config.SLIPPAGE_PCT)
@@ -179,7 +179,7 @@ def backtest_portfolio(data_by_symbol: dict[str, pd.DataFrame], initial_capital:
             if pos is None:
                 continue
 
-            pnl_pct = (price - pos["avg"]) / pos["avg"]
+            pnl_pct = (price - pos["avg"]) / pos["avg"] if pos["avg"] > 0 else 0
             exit_type = None
             if signal == "SELL":
                 exit_type = "SELL"
