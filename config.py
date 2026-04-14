@@ -1,6 +1,8 @@
 """Configuration for the paper trading agent."""
 
+import json
 import os
+import time
 
 # Project root directory (so files are found regardless of cwd)
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -69,3 +71,50 @@ USE_LEVERAGE = False  # Enable when comfortable with the strategy
 # Data settings
 DATA_INTERVAL = "5m"  # 5-minute candles for intraday
 BACKTEST_DAYS = 60  # Days of historical data for backtesting
+
+# ── Hot-reload from config_overrides.json ─────────────────────
+# Drop a config_overrides.json in PROJECT_DIR to change settings at runtime.
+# Only the keys listed in _RELOADABLE are honoured; unknown keys are ignored.
+# The file is re-read at most once every 60 seconds.
+
+_OVERRIDES_FILE = os.path.join(PROJECT_DIR, "config_overrides.json")
+_RELOADABLE = {
+    "MAX_POSITION_SIZE_PCT", "MAX_OPEN_POSITIONS",
+    "STOP_LOSS_PCT", "TAKE_PROFIT_PCT", "DYNAMIC_TRAILING_ENABLED",
+    "MIN_STOP_LOSS_PCT", "MAX_STOP_LOSS_PCT", "MIN_TAKE_PROFIT_PCT",
+    "MAX_TAKE_PROFIT_PCT", "RSI_OVERSOLD", "RSI_OVERBOUGHT",
+    "CAPITAL_DEPLOYMENT_TARGET_PCT", "CAPITAL_UTILIZATION_MIN_BET_PCT",
+    "DATA_INTERVAL", "BACKTEST_DAYS",
+}
+_last_reload: float = 0
+_RELOAD_INTERVAL = 60  # seconds
+
+
+def reload_overrides(force: bool = False) -> list[str]:
+    """Re-read config_overrides.json and apply any reloadable settings.
+
+    Returns list of keys that were updated (empty if nothing changed).
+    Called automatically by autopilot at the start of each cycle.
+    """
+    global _last_reload
+    now = time.time()
+    if not force and (now - _last_reload) < _RELOAD_INTERVAL:
+        return []
+    _last_reload = now
+
+    if not os.path.exists(_OVERRIDES_FILE):
+        return []
+
+    try:
+        with open(_OVERRIDES_FILE, "r") as f:
+            overrides = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+
+    changed = []
+    mod = globals()
+    for key, value in overrides.items():
+        if key in _RELOADABLE and mod.get(key) != value:
+            mod[key] = value
+            changed.append(key)
+    return changed

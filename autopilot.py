@@ -12,7 +12,7 @@ import config
 from data_fetcher import get_watchlist_prices, get_historical_data, get_market_regime
 from paper_trader import PaperTrader, D
 from ai_strategy import analyze_watchlist, get_portfolio_advice
-from strategy import get_latest_signal
+from strategy import get_latest_signal, get_scored_signal
 from learner import log_trade, record_outcome, get_snapshot, generate_lessons, print_performance_report
 from predictor import predict, train_model, should_retrain
 from logger import logger
@@ -220,7 +220,11 @@ def scan_trending_stocks(held_symbols: set[str] | None = None, cycle_num: int = 
             logger.info(f"  [SCAN] - {sym}: removed (cold)")
 
     config.WATCHLIST = list(current)
-    write_json_atomic(WATCHLIST_STATE_FILE, {"hold_cycles": held_cycles, "updated_at": now_ist().isoformat()})
+    write_json_atomic(WATCHLIST_STATE_FILE, {
+        "watchlist": config.WATCHLIST,
+        "hold_cycles": held_cycles,
+        "updated_at": now_ist().isoformat(),
+    })
     logger.info(f"  [SCAN] Watchlist: {len(config.WATCHLIST)} stocks")
     return added
 
@@ -255,7 +259,33 @@ def run_trading_cycle(
     if use_ai:
         # Step 1: AI signals (includes news + trade history learning)
         logger.info("  [1/4] Getting AI signals (technicals + news + learning)...")
-        signals = analyze_watchlist()
+        try:
+            signals = analyze_watchlist()
+        except Exception as e:
+            logger.warning(f"  [AI] Gemini unavailable ({e}). Falling back to rule-based signals.")
+            signals = []
+
+        if not signals:
+            logger.info("  [AI] No AI signals returned. Running multi-indicator fallback...")
+            for symbol in config.WATCHLIST:
+                df = get_historical_data(symbol, period="30d", interval="1d")
+                if df.empty:
+                    continue
+                sig = get_scored_signal(symbol, df)
+                if sig["signal"] in ("BUY", "SELL") and sig["confidence"] >= 0.55:
+                    # Scale position size conservatively from confidence
+                    size_pct = max(0.02, min(sig["confidence"] * 0.08, 0.06))
+                    signals.append({
+                        "symbol": symbol,
+                        "signal": sig["signal"],
+                        "confidence": sig["confidence"],
+                        "price": sig.get("price", 0),
+                        "reason": f"[Fallback] {sig.get('reason', '')}",
+                        "position_size_pct": size_pct,
+                    })
+            signals.sort(key=lambda s: s["confidence"], reverse=True)
+            if signals:
+                logger.info(f"  [AI] Fallback produced {len(signals)} scored signals (top: {signals[0]['symbol']} @ {signals[0]['confidence']:.0%})")
 
         # Step 2: ML predictions (only used if model is mature enough)
         logger.info("  [2/4] Getting ML predictions...")
@@ -413,6 +443,13 @@ def run_autopilot(interval_min: int = 15, use_ai: bool = True, force: bool = Fal
     cycle = 0
     last_train_date = None
     SCAN_EVERY_N_CYCLES = 3  # Every 3 cycles = 45 min at 15-min interval
+
+    # Restore persisted watchlist from last session (scan_trending_stocks saves it)
+    saved_state = read_json(WATCHLIST_STATE_FILE, default={})
+    saved_watchlist = saved_state.get("watchlist")
+    if saved_watchlist and isinstance(saved_watchlist, list) and len(saved_watchlist) >= MIN_WATCHLIST:
+        config.WATCHLIST = saved_watchlist
+        logger.info(f"  [SCAN] Restored watchlist from last session: {len(config.WATCHLIST)} stocks")
     day_start_equity: float | None = None
     day_ref: datetime.date | None = None
     symbol_cooldown: dict[str, datetime] = {}
@@ -452,6 +489,11 @@ def run_autopilot(interval_min: int = 15, use_ai: bool = True, force: bool = Fal
                 except Exception as e:
                     logger.error(f"  [ML] Training failed: {e}")
                 last_train_date = today
+
+            # Hot-reload config overrides (watchlist, risk params, etc.)
+            changed = config.reload_overrides()
+            if changed:
+                logger.info(f"  [CONFIG] Hot-reloaded: {', '.join(changed)}")
 
             cycle += 1
 
