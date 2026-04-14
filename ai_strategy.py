@@ -4,9 +4,12 @@ import os
 import json
 import time
 import re
+import asyncio
 from google import genai
+from google.genai import types
 import pandas as pd
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
 
 import config
 from logger import logger
@@ -17,16 +20,23 @@ load_dotenv()
 # Rate limiting for free tier
 _MIN_DELAY_BETWEEN_CALLS = 5  # seconds between API calls
 _MAX_RETRIES = 3
-# Fallback model chain — if one is rate-limited, try the next
-# Model priority: Gemma 4 has 1500 RPD + unlimited TPM on free tier
-# Gemini 2.5 Flash is smarter but only 20 RPD
+
 _MODELS = [
-    "gemma-4-31b-it",            # 1,500 RPD, unlimited TPM (primary)
-    "gemini-2.5-flash",          # 20 RPD, 250K TPM (smarter, limited)
-    "gemini-3.1-flash-lite-preview",  # 500 RPD, 250K TPM (fallback)
-    "gemma-4-26b-a4b-it",        # 1,500 RPD, unlimited TPM (last resort)
+    "gemini-2.5-flash",          # Supports Structured Outputs best
+    "gemma-4-31b-it",
+    "gemini-3.1-flash-lite-preview",
+    "gemma-4-26b-a4b-it",
 ]
 
+class SignalSchema(BaseModel):
+    symbol: str
+    signal: str = Field(description="'BUY', 'SELL', or 'HOLD'")
+    confidence: float = Field(description="0.0 to 1.0")
+    position_size_pct: float = Field(description="0.01 to 1.0")
+    reason: str
+    entry_price: float | None = None
+    stop_loss: float | None = None
+    target: float | None = None
 
 def _sanitize_prompt_text(text: str, limit: int = 240) -> str:
     cleaned = re.sub(r"https?://\S+", "", text or "")
@@ -36,7 +46,10 @@ def _sanitize_prompt_text(text: str, limit: int = 240) -> str:
     return cleaned[:limit]
 
 
-def _normalize_signal_record(raw: dict, symbol: str, fallback_price: float) -> dict:
+def _normalize_signal_record(raw: dict | SignalSchema, symbol: str, fallback_price: float) -> dict:
+    if isinstance(raw, SignalSchema):
+        raw = raw.model_dump()
+    
     signal = str(raw.get("signal", "HOLD")).upper()
     if signal not in {"BUY", "SELL", "HOLD"}:
         signal = "HOLD"
@@ -84,15 +97,26 @@ def _get_client():
     return genai.Client(api_key=api_key)
 
 
-def _call_gemini(client, prompt: str, retries: int = _MAX_RETRIES) -> str:
-    """Call Gemini with model fallback and retry on rate limits."""
+async def _call_gemini_async(client, prompt: str, retries: int = _MAX_RETRIES, response_schema=None) -> str | BaseModel | list[BaseModel]:
+    """Call Gemini with model fallback and retry on rate limits (Async)."""
+    
+    kwargs = {}
+    if response_schema:
+        kwargs["config"] = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=response_schema,
+        )
+
     for model in _MODELS:
         for attempt in range(retries):
             try:
-                response = client.models.generate_content(
+                response = await client.aio.models.generate_content(
                     model=model,
                     contents=prompt,
+                    **kwargs
                 )
+                if response_schema:
+                    return response.parsed
                 return response.text.strip()
             except Exception as e:
                 error_str = str(e)
@@ -100,15 +124,19 @@ def _call_gemini(client, prompt: str, retries: int = _MAX_RETRIES) -> str:
                     if attempt < retries - 1:
                         wait = _MIN_DELAY_BETWEEN_CALLS * (attempt + 2)
                         logger.warning(f"    Rate limited on {model}, waiting {wait}s...")
-                        time.sleep(wait)
+                        await asyncio.sleep(wait)
                     else:
                         logger.warning(f"    {model} exhausted, trying next model...")
-                        break  # try next model
+                        break
                 elif "404" in error_str or "NOT_FOUND" in error_str:
-                    break  # model doesn't exist, try next
+                    break
+                elif "schema" in error_str.lower() and response_schema:
+                    # Model might not support structured outputs perfectly
+                    logger.warning(f"    Model {model} failed with structured outputs: {e}")
+                    break
                 else:
                     raise
-    raise Exception("All Gemini models exhausted. Try again later or check your API quota at https://ai.dev/rate-limit")
+    raise Exception("All Gemini models exhausted. Try again later or check your API quota.")
 
 
 def _prepare_stock_summary(symbol: str, df: pd.DataFrame) -> str:
@@ -159,179 +187,6 @@ def _prepare_stock_summary(symbol: str, df: pd.DataFrame) -> str:
     return summary
 
 
-def analyze_batch(stock_data: list[tuple[str, pd.DataFrame]]) -> list[dict]:
-    """Analyze ALL stocks in a single Gemini call to save API quota."""
-    client = _get_client()
-
-    summaries = []
-    symbols = []
-    for symbol, df in stock_data:
-        summaries.append(_prepare_stock_summary(symbol, df))
-        symbols.append(symbol)
-
-    all_summaries = "\n---\n".join(summaries)
-
-    # Get learning context from past trades
-    from learner import get_learning_context
-    learning = get_learning_context()
-
-    # Get news sentiment
-    from news_sentiment import get_sentiment_context
-    news_context = get_sentiment_context(symbols)
-
-    prompt = f"""You are a quantitative trading analyst that learns from past performance and reads market news.
-
-{learning}
-
-{news_context}
-
-STOCKS DATA:
-{all_summaries}
-
-PORTFOLIO: Rs.{config.INITIAL_CAPITAL} capital, max {config.MAX_POSITION_SIZE_PCT*100}% per position, {config.STOP_LOSS_PCT*100}% stop loss, {config.TAKE_PROFIT_PCT*100}% take profit.
-
-IMPORTANT RULES:
-1. Use trade history to avoid repeating losing patterns and favor winning setups.
-2. NEWS SENTIMENT is critical — if news is bearish for a stock, lower confidence even if technicals look good. If news is very bullish, boost confidence.
-3. If overall market mood is BEARISH, be more cautious with all BUY signals.
-4. If a company has negative news (scandal, downgrade, earnings miss), signal SELL or HOLD regardless of technicals.
-
-Respond ONLY with a valid JSON array (no markdown, no extra text). One object per stock:
-[
-  {{
-    "symbol": "SYMBOL.NS",
-    "signal": "BUY" or "SELL" or "HOLD",
-    "confidence": 0.0 to 1.0,
-    "position_size_pct": 0.01 to 1.0,
-    "reason": "brief explanation",
-    "entry_price": number or null,
-    "stop_loss": number or null,
-    "target": number or null
-  }}
-]"""
-
-    try:
-        text = _call_gemini(client, prompt)
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1]
-            text = text.rsplit("```", 1)[0]
-        results = json.loads(text)
-
-        # Strictly normalize model output to expected schema.
-        price_map = {}
-        for symbol, df in stock_data:
-            if not df.empty:
-                price_map[symbol] = float(df["Close"].dropna().iloc[-1])
-        normalized = []
-        by_symbol = {item.get("symbol"): item for item in results if isinstance(item, dict)}
-        for sym, _df in stock_data:
-            raw = by_symbol.get(sym, {})
-            normalized.append(_normalize_signal_record(raw, sym, price_map.get(sym, 0.0)))
-        return normalized
-    except Exception as e:
-        logger.error(f"    Batch analysis failed: {e}")
-        return [
-            {
-                "symbol": sym,
-                "signal": "HOLD",
-                "confidence": 0.0,
-                "reason": f"AI analysis failed: {e}",
-                "price": float(df["Close"].dropna().iloc[-1]) if not df.empty else 0,
-            }
-            for sym, df in stock_data
-        ]
-
-
-def analyze_single_stock(symbol: str, df: pd.DataFrame) -> dict:
-    """Use Gemini to analyze a single stock."""
-    client = _get_client()
-    summary = _prepare_stock_summary(symbol, df)
-
-    prompt = f"""You are a quantitative trading analyst. Analyze this Indian stock and provide a trading recommendation.
-
-STOCK DATA:
-{summary}
-
-PORTFOLIO: Rs.{config.INITIAL_CAPITAL} capital, max {config.MAX_POSITION_SIZE_PCT*100}% per position, {config.STOP_LOSS_PCT*100}% stop loss, {config.TAKE_PROFIT_PCT*100}% take profit.
-
-Respond ONLY with valid JSON (no markdown, no extra text):
-{{
-    "signal": "BUY" or "SELL" or "HOLD",
-    "confidence": 0.0 to 1.0,
-    "position_size_pct": 0.01 to 1.0,
-    "reason": "brief 1-2 sentence explanation",
-    "entry_price": suggested entry price or null,
-    "stop_loss": suggested stop loss price or null,
-    "target": suggested target price or null
-}}"""
-
-    try:
-        text = _call_gemini(client, prompt)
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1]
-            text = text.rsplit("```", 1)[0]
-        result = json.loads(text)
-        return _normalize_signal_record(result, symbol, float(df["Close"].dropna().iloc[-1]))
-    except Exception as e:
-        return {
-            "symbol": symbol,
-            "signal": "HOLD",
-            "confidence": 0.0,
-            "reason": f"AI analysis failed: {e}",
-            "price": float(df["Close"].dropna().iloc[-1]) if not df.empty else 0,
-        }
-
-
-def analyze_watchlist(watchlist: list[str] | None = None) -> list[dict]:
-    """Analyze all stocks in watchlist using a single batched Gemini call."""
-    from data_fetcher import get_historical_data
-
-    if watchlist is None:
-        watchlist = config.WATCHLIST
-
-    # Fetch all data first
-    stock_data = []
-    for symbol in watchlist:
-        df = get_historical_data(symbol, period="60d", interval="1d")
-        if not df.empty:
-            stock_data.append((symbol, df))
-
-    if not stock_data:
-        return []
-
-    # Single API call for all stocks (saves quota!)
-    logger.info(f"  Sending {len(stock_data)} stocks to Gemini in one batch...")
-    return analyze_batch(stock_data)
-
-
-import asyncio
-
-async def _call_gemini_async(client, prompt: str, retries: int = _MAX_RETRIES) -> str:
-    """Call Gemini with model fallback and retry on rate limits (Async)."""
-    for model in _MODELS:
-        for attempt in range(retries):
-            try:
-                response = await client.aio.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                )
-                return response.text.strip()
-            except Exception as e:
-                error_str = str(e)
-                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                    if attempt < retries - 1:
-                        wait = _MIN_DELAY_BETWEEN_CALLS * (attempt + 2)
-                        logger.warning(f"    Rate limited on {model}, waiting {wait}s...")
-                        await asyncio.sleep(wait)
-                    else:
-                        logger.warning(f"    {model} exhausted, trying next model...")
-                        break
-                elif "404" in error_str or "NOT_FOUND" in error_str:
-                    break
-                else:
-                    raise
-    raise Exception("All Gemini models exhausted. Try again later or check your API quota.")
-
 async def analyze_batch_async(stock_data: list[tuple[str, pd.DataFrame]]) -> list[dict]:
     """Analyze ALL stocks in a single Gemini call to save API quota (Async)."""
     client = _get_client()
@@ -366,37 +221,22 @@ IMPORTANT RULES:
 2. NEWS SENTIMENT is critical — if news is bearish for a stock, lower confidence even if technicals look good. If news is very bullish, boost confidence.
 3. If overall market mood is BEARISH, be more cautious with all BUY signals.
 4. If a company has negative news (scandal, downgrade, earnings miss), signal SELL or HOLD regardless of technicals.
-
-Respond ONLY with a valid JSON array (no markdown, no extra text). One object per stock:
-[
-  {{
-    "symbol": "SYMBOL.NS",
-    "signal": "BUY" or "SELL" or "HOLD",
-    "confidence": 0.0 to 1.0,
-    "position_size_pct": 0.01 to 1.0,
-    "reason": "brief explanation",
-    "entry_price": number or null,
-    "stop_loss": number or null,
-    "target": number or null
-  }}
-]"""
+"""
 
     try:
-        text = await _call_gemini_async(client, prompt)
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1]
-            text = text.rsplit("```", 1)[0]
-        results = json.loads(text)
+        results = await _call_gemini_async(client, prompt, response_schema=list[SignalSchema])
 
         price_map = {}
         for symbol, df in stock_data:
             if not df.empty:
                 price_map[symbol] = float(df["Close"].dropna().iloc[-1])
+        
         normalized = []
-        by_symbol = {item.get("symbol"): item for item in results if isinstance(item, dict)}
-        for sym, _df in stock_data:
-            raw = by_symbol.get(sym, {})
-            normalized.append(_normalize_signal_record(raw, sym, price_map.get(sym, 0.0)))
+        if results:
+            by_symbol = {item.symbol: item for item in results}
+            for sym, _df in stock_data:
+                raw = by_symbol.get(sym, {})
+                normalized.append(_normalize_signal_record(raw, sym, price_map.get(sym, 0.0)))
         return normalized
     except Exception as e:
         logger.error(f"    Batch analysis failed: {e}")
@@ -411,6 +251,7 @@ Respond ONLY with a valid JSON array (no markdown, no extra text). One object pe
             for sym, df in stock_data
         ]
 
+
 async def analyze_watchlist_async(watchlist: list[str] | None = None) -> list[dict]:
     """Analyze all stocks in watchlist using a single batched Gemini call (Async)."""
     from data_fetcher import get_historical_data
@@ -418,21 +259,37 @@ async def analyze_watchlist_async(watchlist: list[str] | None = None) -> list[di
     if watchlist is None:
         watchlist = config.WATCHLIST
 
-    def fetch_all():
-        data = []
-        for symbol in watchlist:
-            df = get_historical_data(symbol, period="60d", interval="1d")
-            if not df.empty:
-                data.append((symbol, df))
-        return data
-        
-    stock_data = await asyncio.to_thread(fetch_all)
+    async def fetch_one(symbol):
+        df = await asyncio.to_thread(get_historical_data, symbol, period="60d", interval="1d")
+        if not df.empty:
+            return (symbol, df)
+        return None
+
+    # Fetch data concurrently using asyncio.gather
+    tasks = [fetch_one(sym) for sym in watchlist]
+    results = await asyncio.gather(*tasks)
+    stock_data = [res for res in results if res is not None]
 
     if not stock_data:
         return []
 
     logger.info(f"  Sending {len(stock_data)} stocks to Gemini in one batch (async)...")
     return await analyze_batch_async(stock_data)
+
+def analyze_watchlist(watchlist: list[str] | None = None) -> list[dict]:
+    """Sync wrapper for analyze_watchlist_async."""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+    if loop.is_running():
+        # In case it's called from an already running loop (like FastAPI without await)
+        # It's better to just raise or handle it. This shouldn't happen if properly refactored.
+        return asyncio.run_coroutine_threadsafe(analyze_watchlist_async(watchlist), loop).result()
+    else:
+        return loop.run_until_complete(analyze_watchlist_async(watchlist))
 
 def get_portfolio_advice(portfolio_summary: dict, signals: list[dict]) -> str:
     """Get Gemini's advice on overall portfolio strategy."""
@@ -452,7 +309,14 @@ Give brief actionable advice (under 150 words):
 3. Strategy for Rs.{config.INITIAL_CAPITAL} capital"""
 
     try:
-        text = _call_gemini(client, prompt)
-        return text
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+        
+        if loop.is_running():
+            return asyncio.run_coroutine_threadsafe(_call_gemini_async(client, prompt), loop).result()
+        else:
+            return loop.run_until_complete(_call_gemini_async(client, prompt))
     except Exception as e:
         return f"Could not get portfolio advice: {e}"
