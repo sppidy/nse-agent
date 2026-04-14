@@ -23,10 +23,10 @@ _MIN_DELAY_BETWEEN_CALLS = 5  # seconds between API calls
 _MAX_RETRIES = 3
 
 _MODELS = [
-    "gemini-2.5-flash",          # Supports Structured Outputs best
     "gemma-4-31b-it",
-    "gemini-3.1-flash-lite-preview",
     "gemma-4-26b-a4b-it",
+    "gemini-3-flash",
+    "gemini-3.1-flash-lite-preview",
 ]
 
 class SignalSchema(BaseModel):
@@ -216,6 +216,11 @@ async def analyze_batch_async(stock_data: list[tuple[str, pd.DataFrame]]) -> lis
     for symbol, df in stock_data:
         summaries.append(_prepare_stock_summary(symbol, df))
         symbols.append(symbol)
+    price_map = {
+        symbol: float(df["Close"].dropna().iloc[-1])
+        for symbol, df in stock_data
+        if not df.empty and not df["Close"].dropna().empty
+    }
 
     all_summaries = "\n---\n".join(summaries)
 
@@ -224,6 +229,19 @@ async def analyze_batch_async(stock_data: list[tuple[str, pd.DataFrame]]) -> lis
 
     from news_sentiment import get_sentiment_context
     news_context = await asyncio.to_thread(get_sentiment_context, symbols)
+    if not str(news_context).startswith("NEWS SENTIMENT ANALYSIS:"):
+        reason = f"Sentiment analysis unavailable; trade decisions blocked ({news_context})"
+        logger.error(f"    {reason}")
+        return [
+            {
+                "symbol": sym,
+                "signal": "HOLD",
+                "confidence": 0.0,
+                "reason": reason,
+                "price": price_map.get(sym, 0.0),
+            }
+            for sym, _ in stock_data
+        ]
 
     prompt = f"""You are a quantitative trading analyst that learns from past performance and reads market news.
 
@@ -245,11 +263,6 @@ IMPORTANT RULES:
 
     try:
         results = await _call_gemini_async(client, prompt, response_schema=list[SignalSchema])
-
-        price_map = {}
-        for symbol, df in stock_data:
-            if not df.empty:
-                price_map[symbol] = float(df["Close"].dropna().iloc[-1])
         
         normalized = []
         if results:
