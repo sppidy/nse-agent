@@ -10,7 +10,7 @@ import pandas as pd
 
 import config
 from data_fetcher import get_watchlist_prices, get_historical_data, get_market_regime
-from paper_trader import PaperTrader
+from paper_trader import PaperTrader, D
 from ai_strategy import analyze_watchlist, get_portfolio_advice
 from strategy import get_latest_signal
 from learner import log_trade, record_outcome, get_snapshot, generate_lessons, print_performance_report
@@ -337,8 +337,9 @@ def run_trading_cycle(
                 price = prices.get(symbol, sig.get("price", 0))
                 pos = trader.portfolio.positions.get(symbol)
                 if price > 0 and pos:
-                    pnl = pos.pnl(price)
-                    pnl_pct = pos.pnl_pct(price)
+                    price_d = D(price)
+                    pnl = pos.pnl(price_d)
+                    pnl_pct = pos.pnl_pct(price_d)
                     logger.info(f"  [AI] {sig.get('reason', '')} ({ml_tag})")
                     order = trader.sell(symbol, price)
                     if order:
@@ -376,7 +377,7 @@ def run_trading_cycle(
 
     if trader.portfolio.positions:
         for sym, pos in trader.portfolio.positions.items():
-            current = prices.get(sym, pos.avg_price)
+            current = D(prices.get(sym, pos.avg_price))
             pnl = pos.pnl(current)
             pnl_pct = pos.pnl_pct(current)
             pnl_str = f"+Rs.{pnl:.2f}" if pnl >= 0 else f"-Rs.{abs(pnl):.2f}"
