@@ -121,10 +121,15 @@ async def _call_gemini_async(client, prompt: str, retries: int = _MAX_RETRIES, r
                 return response.text.strip()
             except Exception as e:
                 error_str = str(e)
-                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                if (
+                    "429" in error_str
+                    or "RESOURCE_EXHAUSTED" in error_str
+                    or "503" in error_str
+                    or "UNAVAILABLE" in error_str
+                ):
                     if attempt < retries - 1:
                         wait = _MIN_DELAY_BETWEEN_CALLS * (attempt + 2)
-                        logger.warning(f"    Rate limited on {model}, waiting {wait}s...")
+                        logger.warning(f"    Model {model} temporarily unavailable, waiting {wait}s...")
                         await asyncio.sleep(wait)
                     else:
                         logger.warning(f"    {model} exhausted, trying next model...")
