@@ -5,6 +5,7 @@ import json
 import time
 import re
 import asyncio
+import concurrent.futures
 from google import genai
 from google.genai import types
 import pandas as pd
@@ -137,6 +138,20 @@ async def _call_gemini_async(client, prompt: str, retries: int = _MAX_RETRIES, r
                 else:
                     raise
     raise Exception("All Gemini models exhausted. Try again later or check your API quota.")
+
+
+def _call_gemini(client, prompt: str, retries: int = _MAX_RETRIES) -> str:
+    """Sync compatibility wrapper for modules that still call _call_gemini."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_call_gemini_async(client, prompt, retries=retries))
+
+    # If a loop is already running in this thread, run in a worker thread.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(
+            lambda: asyncio.run(_call_gemini_async(client, prompt, retries=retries))
+        ).result()
 
 
 def _prepare_stock_summary(symbol: str, df: pd.DataFrame) -> str:
