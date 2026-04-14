@@ -45,10 +45,24 @@ def is_market_trading_day(day: date | None = None) -> bool:
         ticker = yf.Ticker(config.MARKET_INDEX)
 
         if day == today:
-            intraday = ticker.history(period="1d", interval="1m")
+            intraday = ticker.history(period="5d", interval="1m")
             if not intraday.empty:
-                _day_cache[day] = True
+                idx = intraday.index
+                try:
+                    idx_ist = idx.tz_convert(IST) if getattr(idx, "tz", None) else idx.tz_localize(IST)
+                except Exception:
+                    idx_ist = idx
+                latest_bar_day = idx_ist.max().date()
+                if latest_bar_day == today:
+                    _day_cache[day] = True
+                    return True
+
+            # Before opening bell, today's bars may not exist yet.
+            # Do not cache this assumption so we can re-evaluate once market hours start.
+            if now_ist().time() < MARKET_OPEN_TIME:
                 return True
+            _day_cache[day] = False
+            return False
 
         next_day = day + timedelta(days=1)
         daily = ticker.history(
