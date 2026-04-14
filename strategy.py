@@ -36,45 +36,26 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
     """
     Generate BUY/SELL signals based on RSI + EMA crossover strategy.
-
-    BUY when:
-      - RSI < oversold threshold (stock is beaten down)
-      - Short EMA crosses above Long EMA (momentum turning up)
-      - Volume is above average (confirmation)
-
-    SELL when:
-      - RSI > overbought threshold (stock is overextended)
-      - Short EMA crosses below Long EMA (momentum turning down)
     """
     df = add_indicators(df)
     df["signal"] = "HOLD"
 
-    for i in range(1, len(df)):
-        if pd.isna(df.iloc[i]["rsi"]) or pd.isna(df.iloc[i]["ema_long"]):
-            continue
+    prev_ema_short = df["ema_short"].shift(1)
+    prev_ema_long = df["ema_long"].shift(1)
 
-        rsi = df.iloc[i]["rsi"]
-        ema_short = df.iloc[i]["ema_short"]
-        ema_long = df.iloc[i]["ema_long"]
-        prev_ema_short = df.iloc[i - 1]["ema_short"]
-        prev_ema_long = df.iloc[i - 1]["ema_long"]
-        volume = df.iloc[i]["Volume"]
-        volume_sma = df.iloc[i]["volume_sma"]
+    ema_crossover = (prev_ema_short <= prev_ema_long) & (df["ema_short"] > df["ema_long"])
+    rsi_oversold = df["rsi"] < config.RSI_OVERSOLD
+    volume_confirm = df["volume_sma"].isna() | (df["Volume"] > df["volume_sma"] * 0.8)
 
-        # BUY signal
-        ema_crossover = prev_ema_short <= prev_ema_long and ema_short > ema_long
-        rsi_oversold = rsi < config.RSI_OVERSOLD
-        volume_confirm = pd.isna(volume_sma) or volume > volume_sma * 0.8
+    buy_cond = (ema_crossover | rsi_oversold) & volume_confirm
 
-        if (ema_crossover or rsi_oversold) and volume_confirm:
-            df.iloc[i, df.columns.get_loc("signal")] = "BUY"
+    ema_crossunder = (prev_ema_short >= prev_ema_long) & (df["ema_short"] < df["ema_long"])
+    rsi_overbought = df["rsi"] > config.RSI_OVERBOUGHT
 
-        # SELL signal
-        ema_crossunder = prev_ema_short >= prev_ema_long and ema_short < ema_long
-        rsi_overbought = rsi > config.RSI_OVERBOUGHT
+    sell_cond = ema_crossunder | rsi_overbought
 
-        if ema_crossunder or rsi_overbought:
-            df.iloc[i, df.columns.get_loc("signal")] = "SELL"
+    df.loc[buy_cond, "signal"] = "BUY"
+    df.loc[sell_cond, "signal"] = "SELL"
 
     return df
 
