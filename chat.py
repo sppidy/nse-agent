@@ -110,7 +110,7 @@ def _get_market_snapshot() -> str:
             df = add_indicators(df)
             latest = df.iloc[-1]
             prev = df.iloc[-2] if len(df) > 1 else latest
-            chg = ((latest["Close"] - prev["Close"]) / prev["Close"]) * 100
+            chg = ((latest["Close"] - prev["Close"]) / prev["Close"]) * 100 if prev["Close"] != 0 else 0
             ema = "B" if latest["ema_short"] > latest["ema_long"] else "X"
             lines.append(f"{symbol.replace('.NS','')}|{latest['Close']:.1f}|{chg:+.1f}%|RSI:{latest['rsi']:.0f}|EMA:{ema}")
         except Exception:

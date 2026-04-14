@@ -103,8 +103,8 @@ def _trend_score(hist: pd.DataFrame) -> float | None:
     if price <= 0:
         return None
 
-    ret_5d = float(((close.iloc[-1] - close.iloc[-6]) / close.iloc[-6]) * 100) if len(close) >= 6 else 0.0
-    ret_20d = float(((close.iloc[-1] - close.iloc[-20]) / close.iloc[-20]) * 100)
+    ret_5d = float(((close.iloc[-1] - close.iloc[-6]) / close.iloc[-6]) * 100) if len(close) >= 6 and close.iloc[-6] != 0 else 0.0
+    ret_20d = float(((close.iloc[-1] - close.iloc[-20]) / close.iloc[-20]) * 100) if close.iloc[-20] != 0 else 0.0
     avg_vol = float(volume.tail(20).mean())
     vol_ratio = float(volume.iloc[-1] / avg_vol) if avg_vol > 0 else 1.0
     daily_ret = close.pct_change().dropna().tail(20)

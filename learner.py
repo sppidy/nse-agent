@@ -90,7 +90,8 @@ def get_snapshot(symbol: str, df: pd.DataFrame) -> dict:
         "ema_signal": "bullish" if latest.get("ema_short", 0) > latest.get("ema_long", 0) else "bearish",
         "volume_vs_avg": round(float(latest["Volume"] / latest["volume_sma"]), 2)
             if pd.notna(latest.get("volume_sma")) and latest.get("volume_sma", 0) > 0 else None,
-        "day_change_pct": round(float((latest["Close"] - latest["Open"]) / latest["Open"] * 100), 2),
+        "day_change_pct": round(float((latest["Close"] - latest["Open"]) / latest["Open"] * 100), 2)
+            if latest.get("Open", 0) != 0 else 0.0,
     }
 
 
