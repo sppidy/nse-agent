@@ -314,7 +314,7 @@ def _call_gemini(client, prompt: str, retries: int = _MAX_RETRIES) -> str:
 
 
 def _prepare_stock_summary(symbol: str, df: pd.DataFrame) -> str:
-    """Convert stock data into a text summary for Gemini."""
+    """Convert stock data into a text summary for AI."""
     df = add_indicators(df)
     if df.empty or len(df) < 5:
         return f"{symbol}: insufficient data"
@@ -434,7 +434,7 @@ Return ONLY valid JSON. No markdown, no explanation.
 
         normalized = []
         if results:
-            # Build lookup tolerant of Gemini stripping/adding .NS suffix
+            # Build lookup tolerant of AI stripping/adding .NS suffix
             by_symbol: dict[str, SignalSchema] = {}
             for item in results:
                 sym_name = item.symbol if isinstance(item, SignalSchema) else item.get("symbol", "")
@@ -445,9 +445,9 @@ Return ONLY valid JSON. No markdown, no explanation.
             for sym, _df in stock_data:
                 raw = by_symbol.get(sym, by_symbol.get(sym.replace(".NS", ""), {}))
                 normalized.append(_normalize_signal_record(raw, sym, price_map.get(sym, 0.0)))
-            logger.info(f"    Normalized {len(normalized)} signals from Gemini response")
+            logger.info(f"    Normalized {len(normalized)} signals from AI response")
         else:
-            logger.error(f"    No signals could be extracted from Gemini for {len(stock_data)} stocks")
+            logger.error(f"    No signals could be extracted from AI for {len(stock_data)} stocks")
             # Return HOLD signals so the app at least shows something
             for sym, _df in stock_data:
                 normalized.append({
@@ -473,7 +473,7 @@ Return ONLY valid JSON. No markdown, no explanation.
 
 
 async def analyze_watchlist_async(watchlist: list[str] | None = None) -> list[dict]:
-    """Analyze all stocks in watchlist using a single batched Gemini call (Async)."""
+    """Analyze all stocks in watchlist using a single batched AI call (Async)."""
     from data_fetcher import get_historical_data
 
     if watchlist is None:
@@ -501,7 +501,7 @@ async def analyze_watchlist_async(watchlist: list[str] | None = None) -> list[di
         logger.error(f"  [AI-SCAN] All {len(watchlist)} data fetches returned empty — cannot scan")
         return []
 
-    logger.info(f"  [AI-SCAN] Fetched {len(stock_data)}/{len(watchlist)} stocks, sending to Gemini...")
+    logger.info(f"  [AI-SCAN] Fetched {len(stock_data)}/{len(watchlist)} stocks, sending to AI...")
     return await analyze_batch_async(stock_data)
 
 def analyze_watchlist(watchlist: list[str] | None = None) -> list[dict]:

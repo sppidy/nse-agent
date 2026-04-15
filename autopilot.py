@@ -262,7 +262,7 @@ def run_trading_cycle(
         try:
             signals = analyze_watchlist()
         except Exception as e:
-            logger.warning(f"  [AI] Gemini unavailable ({e}). Falling back to rule-based signals.")
+            logger.warning(f"  [AI] AI unavailable ({e}). Falling back to rule-based signals.")
             signals = []
 
         if not signals:
@@ -420,7 +420,7 @@ def run_autopilot(interval_min: int = 15, use_ai: bool = True, force: bool = Fal
 
     Args:
         interval_min: Minutes between each trading cycle
-        use_ai: Use Gemini AI (True) or rule-based strategy (False)
+        use_ai: Use AI/Groq (True) or rule-based strategy (False)
         force: Run even outside market hours (for testing)
     """
     mode = "AI (Gemma 4)" if use_ai else "Rule-based (RSI+EMA)"
