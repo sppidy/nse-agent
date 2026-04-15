@@ -1,4 +1,4 @@
-"""AI-powered trading strategy using Groq (primary), Copilot/Haiku, and Gemini (fallback)."""
+"""AI-powered trading strategy — Copilot/Haiku -> OpenRouter -> Groq -> Gemini."""
 
 import os
 import json
@@ -27,7 +27,16 @@ _COPILOT_MODELS = [
     "gpt-4o-mini",         # Cheap fallback
 ]
 
-# Groq models (primary) — ordered by capability, diversified to spread rate limits
+# OpenRouter (OpenAI-compatible, many free/cheap models)
+_OPENROUTER_URL = "https://openrouter.ai/api/v1"
+_OPENROUTER_MODELS = [
+    "anthropic/claude-haiku-4.5",          # Smart, cheap
+    "meta-llama/llama-3.3-70b-instruct",   # Free on OpenRouter
+    "mistralai/mistral-small-3.1-24b-instruct",  # Free
+    "google/gemma-3-27b-it",               # Free
+]
+
+# Groq models — ordered by capability, diversified to spread rate limits
 # Each model has its own TPM/RPM quota on free tier, so more models = more headroom
 _GROQ_MODELS = [
     "llama-3.3-70b-versatile",      # Best quality, 6K TPM free
@@ -289,6 +298,70 @@ async def _call_copilot_async(prompt: str, retries: int = _MAX_RETRIES, want_jso
     raise Exception("All Copilot models exhausted")
 
 
+async def _call_openrouter_async(prompt: str, retries: int = _MAX_RETRIES, want_json: bool = False) -> str | list[SignalSchema]:
+    """Call OpenRouter API (OpenAI-compatible)."""
+    import httpx
+
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        raise Exception("OPENROUTER_API_KEY not set")
+
+    for model in _OPENROUTER_MODELS:
+        for attempt in range(retries):
+            try:
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3,
+                    "max_tokens": 4096,
+                }
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    resp = await client.post(
+                        f"{_OPENROUTER_URL}/chat/completions",
+                        json=payload,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {api_key}",
+                        },
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+
+                text = data["choices"][0]["message"]["content"].strip()
+
+                if want_json:
+                    signals = _parse_signals_from_text(text)
+                    if signals:
+                        logger.info(f"    OpenRouter/{model}: parsed {len(signals)} signals")
+                        return signals
+                    logger.warning(f"    OpenRouter/{model}: didn't yield signals, trying next model")
+                    break
+                return text
+            except Exception as e:
+                error_str = str(e)
+                if "429" in error_str or "rate" in error_str.lower():
+                    if attempt < retries - 1:
+                        wait = _MIN_DELAY_BETWEEN_CALLS * (attempt + 2)
+                        logger.warning(f"    OpenRouter/{model} rate limited, waiting {wait}s...")
+                        await asyncio.sleep(wait)
+                    else:
+                        logger.warning(f"    OpenRouter/{model} exhausted retries, trying next model...")
+                        break
+                elif "402" in error_str or "insufficient" in error_str.lower():
+                    logger.warning(f"    OpenRouter/{model} no credits, trying next model...")
+                    break
+                elif "404" in error_str or "not_found" in error_str.lower():
+                    logger.warning(f"    OpenRouter/{model} not found, trying next model...")
+                    break
+                else:
+                    logger.warning(f"    OpenRouter/{model} error: {e}")
+                    if attempt < retries - 1:
+                        await asyncio.sleep(_MIN_DELAY_BETWEEN_CALLS)
+                    else:
+                        break
+    raise Exception("All OpenRouter models exhausted")
+
+
 async def _call_gemini_async(client, prompt: str, retries: int = _MAX_RETRIES, response_schema=None) -> str | list[SignalSchema]:
     """Call Gemini with model fallback and retry on rate limits (fallback)."""
     from google.genai import types
@@ -346,21 +419,28 @@ async def _call_gemini_async(client, prompt: str, retries: int = _MAX_RETRIES, r
 
 
 async def _call_ai_async(prompt: str, want_json: bool = False) -> str | list[SignalSchema]:
-    """Call Copilot/Haiku first, then Groq, then Gemini as final fallback."""
-    # Try Copilot proxy first (Claude Haiku via GitHub Copilot — free, smart)
+    """Copilot/Haiku -> OpenRouter -> Groq -> Gemini."""
+    # 1. Copilot proxy (Claude Haiku via GitHub Copilot — free, smart)
     try:
         return await _call_copilot_async(prompt, want_json=want_json)
     except Exception as e:
-        logger.warning(f"    Copilot failed, trying Groq: {e}")
+        logger.warning(f"    Copilot failed, trying OpenRouter: {e}")
 
-    # Groq fallback (free, fast)
+    # 2. OpenRouter (many models, cheap/free)
+    if os.getenv("OPENROUTER_API_KEY"):
+        try:
+            return await _call_openrouter_async(prompt, want_json=want_json)
+        except Exception as e:
+            logger.warning(f"    OpenRouter failed, trying Groq: {e}")
+
+    # 3. Groq (free, fast)
     if os.getenv("GROQ_API_KEY"):
         try:
             return await _call_groq_async(prompt, want_json=want_json)
         except Exception as e:
             logger.warning(f"    Groq failed, falling back to Gemini: {e}")
 
-    # Final fallback: Gemini
+    # 4. Gemini (final fallback)
     gemini_client = _get_gemini_client()
     if gemini_client:
         schema = list[SignalSchema] if want_json else None
