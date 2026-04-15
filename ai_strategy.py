@@ -346,19 +346,19 @@ async def _call_gemini_async(client, prompt: str, retries: int = _MAX_RETRIES, r
 
 
 async def _call_ai_async(prompt: str, want_json: bool = False) -> str | list[SignalSchema]:
-    """Call Groq first, then Copilot/Haiku, then Gemini as final fallback."""
-    # Try Groq first (fast, free)
+    """Call Copilot/Haiku first, then Groq, then Gemini as final fallback."""
+    # Try Copilot proxy first (Claude Haiku via GitHub Copilot — free, smart)
+    try:
+        return await _call_copilot_async(prompt, want_json=want_json)
+    except Exception as e:
+        logger.warning(f"    Copilot failed, trying Groq: {e}")
+
+    # Groq fallback (free, fast)
     if os.getenv("GROQ_API_KEY"):
         try:
             return await _call_groq_async(prompt, want_json=want_json)
         except Exception as e:
-            logger.warning(f"    Groq failed, trying Copilot: {e}")
-
-    # Try Copilot proxy (Claude Haiku via GitHub Copilot)
-    try:
-        return await _call_copilot_async(prompt, want_json=want_json)
-    except Exception as e:
-        logger.warning(f"    Copilot failed, falling back to Gemini: {e}")
+            logger.warning(f"    Groq failed, falling back to Gemini: {e}")
 
     # Final fallback: Gemini
     gemini_client = _get_gemini_client()
@@ -366,7 +366,7 @@ async def _call_ai_async(prompt: str, want_json: bool = False) -> str | list[Sig
         schema = list[SignalSchema] if want_json else None
         return await _call_gemini_async(gemini_client, prompt, response_schema=schema)
 
-    raise Exception("No AI provider available. Set GROQ_API_KEY or GEMINI_API_KEY.")
+    raise Exception("No AI provider available.")
 
 
 def _call_gemini(client, prompt: str, retries: int = _MAX_RETRIES) -> str:
