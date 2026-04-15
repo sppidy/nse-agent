@@ -7,7 +7,6 @@ import time
 from datetime import datetime
 
 from dotenv import load_dotenv
-from google import genai
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -35,42 +34,72 @@ load_dotenv()
 
 console = Console()
 
-# Gemini model chain
-_MODELS = [
-    "gemma-4-31b-it",
-    "gemini-2.5-flash",
-    "gemini-3.1-flash-lite-preview",
-    "gemma-4-26b-a4b-it",
-]
+def _call_ai(prompt: str) -> str:
+    """Call Groq first, Gemini as fallback (sync wrapper)."""
+    # Try Groq first
+    groq_key = os.getenv("GROQ_API_KEY")
+    if groq_key:
+        try:
+            from groq import Groq
+            client = Groq(api_key=groq_key)
+            models = [
+                "llama-3.3-70b-versatile",
+                "qwen/qwen3-32b",
+                "llama-3.1-8b-instant",
+            ]
+            for model in models:
+                for attempt in range(3):
+                    try:
+                        response = client.chat.completions.create(
+                            model=model,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0.4,
+                            max_tokens=1024,
+                        )
+                        return response.choices[0].message.content.strip()
+                    except Exception as e:
+                        err = str(e)
+                        if "429" in err or "rate_limit" in err.lower():
+                            if attempt < 2:
+                                time.sleep(3 * (attempt + 1))
+                            else:
+                                break
+                        elif "404" in err:
+                            break
+                        else:
+                            raise
+        except Exception as e:
+            logger.warning(f"Groq failed, falling back to Gemini: {e}")
 
-
-def _get_client():
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key or api_key == "your_api_key_here":
-        raise ValueError("Set a valid GEMINI_API_KEY in .env")
-    return genai.Client(api_key=api_key)
-
-
-def _call_gemini(client, prompt: str) -> str:
-    for model in _MODELS:
-        for attempt in range(3):
-            try:
-                response = client.models.generate_content(
-                    model=model, contents=prompt
-                )
-                return response.text.strip()
-            except Exception as e:
-                err = str(e)
-                if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                    if attempt < 2:
-                        time.sleep(5 * (attempt + 2))
-                    else:
+    # Fallback to Gemini
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if gemini_key and gemini_key != "your_api_key_here":
+        from google import genai
+        client = genai.Client(api_key=gemini_key)
+        models = [
+            "gemma-4-31b-it",
+            "gemma-4-26b-a4b-it",
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+        ]
+        for model in models:
+            for attempt in range(3):
+                try:
+                    response = client.models.generate_content(model=model, contents=prompt)
+                    return response.text.strip()
+                except Exception as e:
+                    err = str(e)
+                    if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                        if attempt < 2:
+                            time.sleep(5 * (attempt + 2))
+                        else:
+                            break
+                    elif "404" in err or "NOT_FOUND" in err:
                         break
-                elif "404" in err or "NOT_FOUND" in err:
-                    break
-                else:
-                    raise
-    return "Sorry, all AI models are rate-limited right now. Try again in a minute."
+                    else:
+                        raise
+
+    return "All AI models are rate-limited right now. Try again in a minute."
 
 
 def _get_portfolio_data() -> dict:
@@ -282,7 +311,6 @@ def chat():
     history = InMemoryHistory()
 
     # Initialize
-    client = _get_client()
 
     with console.status("[cyan]Loading portfolio, market & news data...", spinner="dots"):
         pdata = _get_portfolio_data()
@@ -416,7 +444,7 @@ User: {user_input}
 Respond helpfully and concisely:"""
 
         with console.status("[cyan]Thinking...", spinner="dots"):
-            response = _call_gemini(client, ai_prompt)
+            response = _call_ai(ai_prompt)
 
         console.print()
         console.print(Panel(
