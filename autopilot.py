@@ -298,7 +298,7 @@ def run_trading_cycle(
                 tlog = _json.load(_f)
             if tlog:
                 latest_accuracy = tlog[-1].get("metrics", {}).get("cv_accuracy", 0)
-                ml_mature = latest_accuracy >= 55  # only trust ML above 55% accuracy
+                ml_mature = latest_accuracy >= 75  # only trust ML above 75% accuracy (learning mode until proven)
                 logger.info(f"  [ML] Model accuracy: {latest_accuracy}% — {'ACTIVE (influencing trades)' if ml_mature else 'OBSERVING ONLY (too immature)'}")
 
         for symbol in config.WATCHLIST:
