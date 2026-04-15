@@ -441,6 +441,7 @@ def run_autopilot(interval_min: int = 15, use_ai: bool = True, force: bool = Fal
 
     trader = PaperTrader()
     cycle = 0
+    cycle_file = os.path.join(config.PROJECT_DIR, "logs", "cycle_count.txt")
     last_train_date = None
     SCAN_EVERY_N_CYCLES = 3  # Every 3 cycles = 45 min at 15-min interval
 
@@ -496,6 +497,12 @@ def run_autopilot(interval_min: int = 15, use_ai: bool = True, force: bool = Fal
                 logger.info(f"  [CONFIG] Hot-reloaded: {', '.join(changed)}")
 
             cycle += 1
+            # Persist cycle count so API can read it without log parsing
+            try:
+                with open(cycle_file, "w") as cf:
+                    cf.write(str(cycle))
+            except Exception:
+                pass
 
             # Trending stock scan: at market start (cycle 1) then every 3 cycles (45 min)
             if cycle == 1 or cycle % SCAN_EVERY_N_CYCLES == 0:
