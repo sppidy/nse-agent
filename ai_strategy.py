@@ -32,7 +32,6 @@ _COPILOT_MODELS = [
 _GROQ_MODELS = [
     "llama-3.3-70b-versatile",      # Best quality, 6K TPM free
     "qwen/qwen3-32b",               # Good quality, 6K TPM free
-    "gemma2-9b-it",                  # 15K TPM free (highest!), solid quality
     "meta-llama/llama-4-scout-17b-16e-instruct",  # Fast, 6K TPM free
     "mistral-saba-24b",             # Mistral quality, 6K TPM free
     "llama-3.1-8b-instant",          # Fastest fallback, 14.4K RPD
@@ -224,8 +223,8 @@ async def _call_groq_async(prompt: str, retries: int = _MAX_RETRIES, want_json: 
                     else:
                         logger.warning(f"    Groq/{model} exhausted retries, trying next model...")
                         break
-                elif "404" in error_str or "not_found" in error_str.lower():
-                    logger.warning(f"    Groq/{model} not found, trying next model...")
+                elif "404" in error_str or "not_found" in error_str.lower() or "decommissioned" in error_str.lower():
+                    logger.warning(f"    Groq/{model} unavailable/decommissioned, trying next model...")
                     break
                 else:
                     logger.warning(f"    Groq/{model} error: {e}")
