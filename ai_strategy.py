@@ -1,4 +1,4 @@
-"""Gemini AI-powered trading strategy."""
+"""AI-powered trading strategy using Groq (primary) and Gemini (fallback)."""
 
 import os
 import json
@@ -6,8 +6,6 @@ import time
 import re
 import asyncio
 import concurrent.futures
-from google import genai
-from google.genai import types
 import pandas as pd
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -18,11 +16,20 @@ from strategy import add_indicators
 
 load_dotenv()
 
-# Rate limiting for free tier
-_MIN_DELAY_BETWEEN_CALLS = 5  # seconds between API calls
+# Rate limiting
+_MIN_DELAY_BETWEEN_CALLS = 2  # seconds between API calls (Groq is fast)
 _MAX_RETRIES = 3
 
-_MODELS = [
+# Groq models (primary) — ordered by capability/speed balance
+_GROQ_MODELS = [
+    "llama-3.3-70b-versatile",      # Best quality, 280 t/s
+    "qwen/qwen3-32b",               # Good quality, 500K TPM free
+    "meta-llama/llama-4-scout-17b-16e-instruct",  # Fast, 750 t/s
+    "llama-3.1-8b-instant",          # Fastest fallback, 560 t/s
+]
+
+# Gemini models (fallback only)
+_GEMINI_MODELS = [
     "gemma-4-31b-it",
     "gemma-4-26b-a4b-it",
     "gemini-2.5-flash",
@@ -87,20 +94,142 @@ def _normalize_signal_record(raw: dict | SignalSchema, symbol: str, fallback_pri
     }
 
 
-def _get_client():
-    """Initialize Gemini client."""
+def _get_groq_client():
+    """Initialize Groq client."""
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        return None
+    from groq import AsyncGroq
+    return AsyncGroq(api_key=api_key)
+
+
+def _get_gemini_client():
+    """Initialize Gemini client (fallback)."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key or api_key == "your_api_key_here":
-        raise ValueError(
-            "Set your GEMINI_API_KEY in .env file.\n"
-            "Get a free key at: https://aistudio.google.com/apikey"
-        )
+        return None
+    from google import genai
     return genai.Client(api_key=api_key)
 
 
-async def _call_gemini_async(client, prompt: str, retries: int = _MAX_RETRIES, response_schema=None) -> str | BaseModel | list[BaseModel]:
-    """Call Gemini with model fallback and retry on rate limits (Async)."""
-    
+# Keep a reference for backward compatibility (chat.py, api_server.py)
+def _get_client():
+    """Return Groq client if available, else Gemini."""
+    client = _get_groq_client()
+    if client:
+        return client
+    client = _get_gemini_client()
+    if client:
+        return client
+    raise ValueError("Set GROQ_API_KEY or GEMINI_API_KEY in .env file.")
+
+
+def _clean_json_text(raw_text: str) -> str:
+    """Strip markdown fences and trailing garbage from JSON text."""
+    clean = raw_text.strip()
+    if clean.startswith("```"):
+        clean = re.sub(r"^```(?:json)?\s*\n?", "", clean)
+        clean = re.sub(r"\n?```\s*$", "", clean)
+        clean = clean.strip()
+    # Sometimes models append extra data after the JSON array
+    if clean.startswith("["):
+        last_bracket = clean.rfind("]")
+        if last_bracket > 0:
+            clean = clean[:last_bracket + 1]
+    return clean
+
+
+def _parse_signals_from_text(raw_text: str) -> list[SignalSchema] | None:
+    """Try to parse SignalSchema list from raw JSON text."""
+    clean = _clean_json_text(raw_text)
+    if not clean:
+        return None
+    try:
+        raw_json = json.loads(clean)
+        # Groq json_object mode may wrap array in {"signals": [...]} or {"results": [...]}
+        if isinstance(raw_json, dict):
+            for key in ("signals", "results", "data", "stocks", "analysis"):
+                if key in raw_json and isinstance(raw_json[key], list):
+                    raw_json = raw_json[key]
+                    break
+            else:
+                # Single signal object — wrap in list
+                if "symbol" in raw_json:
+                    raw_json = [raw_json]
+                else:
+                    return None
+        if isinstance(raw_json, list):
+            results = []
+            for item in raw_json:
+                try:
+                    results.append(SignalSchema(**(item if isinstance(item, dict) else {})))
+                except Exception:
+                    pass
+            if results:
+                return results
+    except json.JSONDecodeError as je:
+        logger.warning(f"    JSON parse failed at char {je.pos}: {je.msg}")
+    return None
+
+
+async def _call_groq_async(prompt: str, retries: int = _MAX_RETRIES, want_json: bool = False) -> str | list[SignalSchema]:
+    """Call Groq API with model fallback and retry on rate limits."""
+    client = _get_groq_client()
+    if not client:
+        raise Exception("GROQ_API_KEY not set")
+
+    kwargs = {}
+    if want_json:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    for model in _GROQ_MODELS:
+        for attempt in range(retries):
+            try:
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3,
+                    max_tokens=4096,
+                    **kwargs,
+                )
+                text = response.choices[0].message.content.strip()
+
+                if want_json:
+                    # Try to parse signals
+                    signals = _parse_signals_from_text(text)
+                    if signals:
+                        logger.info(f"    Groq/{model}: parsed {len(signals)} signals")
+                        return signals
+                    # Model returned JSON but not an array — try wrapping
+                    logger.warning(f"    Groq/{model}: JSON response didn't yield signals, trying next model")
+                    break  # try next model
+                return text
+            except Exception as e:
+                error_str = str(e)
+                if "429" in error_str or "rate_limit" in error_str.lower():
+                    if attempt < retries - 1:
+                        wait = _MIN_DELAY_BETWEEN_CALLS * (attempt + 2)
+                        logger.warning(f"    Groq/{model} rate limited, waiting {wait}s...")
+                        await asyncio.sleep(wait)
+                    else:
+                        logger.warning(f"    Groq/{model} exhausted retries, trying next model...")
+                        break
+                elif "404" in error_str or "not_found" in error_str.lower():
+                    logger.warning(f"    Groq/{model} not found, trying next model...")
+                    break
+                else:
+                    logger.warning(f"    Groq/{model} error: {e}")
+                    if attempt < retries - 1:
+                        await asyncio.sleep(_MIN_DELAY_BETWEEN_CALLS)
+                    else:
+                        break
+    raise Exception("All Groq models exhausted")
+
+
+async def _call_gemini_async(client, prompt: str, retries: int = _MAX_RETRIES, response_schema=None) -> str | list[SignalSchema]:
+    """Call Gemini with model fallback and retry on rate limits (fallback)."""
+    from google.genai import types
+
     kwargs = {}
     if response_schema:
         kwargs["config"] = types.GenerateContentConfig(
@@ -108,7 +237,7 @@ async def _call_gemini_async(client, prompt: str, retries: int = _MAX_RETRIES, r
             response_schema=response_schema,
         )
 
-    for model in _MODELS:
+    for model in _GEMINI_MODELS:
         for attempt in range(retries):
             try:
                 response = await client.aio.models.generate_content(
@@ -120,40 +249,12 @@ async def _call_gemini_async(client, prompt: str, retries: int = _MAX_RETRIES, r
                     parsed = response.parsed
                     if parsed is not None:
                         return parsed
-                    # response.parsed failed — try manual JSON parse of raw text
                     raw_text = (response.text or "").strip()
-                    logger.warning(f"    {model}: response.parsed is None, trying manual JSON parse (text length={len(raw_text)})")
-                    if raw_text:
-                        import json as _json
-                        # Strip markdown code fences if present
-                        clean = raw_text
-                        if clean.startswith("```"):
-                            clean = re.sub(r"^```(?:json)?\s*\n?", "", clean)
-                            clean = re.sub(r"\n?```\s*$", "", clean)
-                            clean = clean.strip()
-                        # Gemini sometimes appends extra data after the JSON array
-                        # Find the last ] and truncate
-                        if clean.startswith("["):
-                            last_bracket = clean.rfind("]")
-                            if last_bracket > 0:
-                                clean = clean[:last_bracket + 1]
-                        try:
-                            raw_json = _json.loads(clean)
-                            if isinstance(raw_json, list):
-                                results = []
-                                for item in raw_json:
-                                    try:
-                                        results.append(SignalSchema(**(item if isinstance(item, dict) else {})))
-                                    except Exception:
-                                        pass
-                                if results:
-                                    logger.info(f"    Manual JSON parse recovered {len(results)} signals")
-                                    return results
-                        except _json.JSONDecodeError as je:
-                            logger.warning(f"    Manual JSON parse failed at char {je.pos}: {je.msg}")
-                            logger.warning(f"    Raw starts: {clean[:200]}")
-                            logger.warning(f"    Raw ends: {clean[-200:]}")
-                    # Don't raise — continue to next model
+                    logger.warning(f"    Gemini/{model}: response.parsed is None, trying manual parse")
+                    signals = _parse_signals_from_text(raw_text)
+                    if signals:
+                        logger.info(f"    Gemini/{model}: manual parse recovered {len(signals)} signals")
+                        return signals
                     continue
                 return response.text.strip()
             except Exception as e:
@@ -166,33 +267,49 @@ async def _call_gemini_async(client, prompt: str, retries: int = _MAX_RETRIES, r
                 ):
                     if attempt < retries - 1:
                         wait = _MIN_DELAY_BETWEEN_CALLS * (attempt + 2)
-                        logger.warning(f"    Model {model} temporarily unavailable, waiting {wait}s...")
+                        logger.warning(f"    Gemini/{model} temporarily unavailable, waiting {wait}s...")
                         await asyncio.sleep(wait)
                     else:
-                        logger.warning(f"    {model} exhausted, trying next model...")
+                        logger.warning(f"    Gemini/{model} exhausted, trying next model...")
                         break
                 elif "404" in error_str or "NOT_FOUND" in error_str:
                     break
                 elif "schema" in error_str.lower() and response_schema:
-                    # Model might not support structured outputs perfectly
-                    logger.warning(f"    Model {model} failed with structured outputs: {e}")
+                    logger.warning(f"    Gemini/{model} schema error: {e}")
                     break
                 else:
                     raise
-    raise Exception("All Gemini models exhausted. Try again later or check your API quota.")
+    raise Exception("All Gemini models exhausted.")
+
+
+async def _call_ai_async(prompt: str, want_json: bool = False) -> str | list[SignalSchema]:
+    """Call Groq first, fall back to Gemini if Groq fails."""
+    # Try Groq first (fast)
+    if os.getenv("GROQ_API_KEY"):
+        try:
+            return await _call_groq_async(prompt, want_json=want_json)
+        except Exception as e:
+            logger.warning(f"    Groq failed, falling back to Gemini: {e}")
+
+    # Fallback to Gemini
+    gemini_client = _get_gemini_client()
+    if gemini_client:
+        schema = list[SignalSchema] if want_json else None
+        return await _call_gemini_async(gemini_client, prompt, response_schema=schema)
+
+    raise Exception("No AI provider available. Set GROQ_API_KEY or GEMINI_API_KEY.")
 
 
 def _call_gemini(client, prompt: str, retries: int = _MAX_RETRIES) -> str:
-    """Sync compatibility wrapper for modules that still call _call_gemini."""
+    """Sync compatibility wrapper — uses Groq first, Gemini as fallback."""
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(_call_gemini_async(client, prompt, retries=retries))
+        return asyncio.run(_call_ai_async(prompt))
 
-    # If a loop is already running in this thread, run in a worker thread.
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         return executor.submit(
-            lambda: asyncio.run(_call_gemini_async(client, prompt, retries=retries))
+            lambda: asyncio.run(_call_ai_async(prompt))
         ).result()
 
 
@@ -245,8 +362,7 @@ def _prepare_stock_summary(symbol: str, df: pd.DataFrame) -> str:
 
 
 async def analyze_batch_async(stock_data: list[tuple[str, pd.DataFrame]]) -> list[dict]:
-    """Analyze ALL stocks in a single Gemini call to save API quota (Async)."""
-    client = _get_client()
+    """Analyze ALL stocks in a single AI call (Groq primary, Gemini fallback)."""
 
     summaries = []
     symbols = []
@@ -298,7 +414,8 @@ RULES:
 2. NEWS SENTIMENT is critical — bearish news lowers confidence, bullish news boosts it.
 3. BEAR market = cautious BUY signals. Negative company news = SELL or HOLD.
 
-OUTPUT: Return a JSON array with exactly {len(symbols)} objects, one per stock.
+OUTPUT: Return a JSON object with a "signals" key containing an array of exactly {len(symbols)} objects, one per stock.
+Example format: {{"signals": [...]}}
 Each object MUST have these fields:
 - "symbol": string (use exact symbol including .NS suffix: {symbol_list})
 - "signal": "BUY" or "SELL" or "HOLD"
@@ -309,11 +426,11 @@ Each object MUST have these fields:
 - "stop_loss": number or null
 - "target": number or null
 
-Return ONLY the JSON array. No markdown, no explanation, no text before or after the JSON.
+Return ONLY valid JSON. No markdown, no explanation.
 """
 
     try:
-        results = await _call_gemini_async(client, prompt, response_schema=list[SignalSchema])
+        results = await _call_ai_async(prompt, want_json=True)
 
         normalized = []
         if results:
@@ -403,9 +520,7 @@ def analyze_watchlist(watchlist: list[str] | None = None) -> list[dict]:
         return loop.run_until_complete(analyze_watchlist_async(watchlist))
 
 def get_portfolio_advice(portfolio_summary: dict, signals: list[dict]) -> str:
-    """Get Gemini's advice on overall portfolio strategy."""
-    client = _get_client()
-
+    """Get AI advice on overall portfolio strategy."""
     prompt = f"""You are a trading advisor for a small Indian retail investor.
 
 PORTFOLIO STATUS:
@@ -424,10 +539,10 @@ Give brief actionable advice (under 150 words):
             loop = asyncio.get_event_loop()
         except RuntimeError:
             loop = asyncio.new_event_loop()
-        
+
         if loop.is_running():
-            return asyncio.run_coroutine_threadsafe(_call_gemini_async(client, prompt), loop).result()
+            return asyncio.run_coroutine_threadsafe(_call_ai_async(prompt), loop).result()
         else:
-            return loop.run_until_complete(_call_gemini_async(client, prompt))
+            return loop.run_until_complete(_call_ai_async(prompt))
     except Exception as e:
         return f"Could not get portfolio advice: {e}"
