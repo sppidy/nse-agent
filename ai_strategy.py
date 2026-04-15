@@ -20,12 +20,15 @@ load_dotenv()
 _MIN_DELAY_BETWEEN_CALLS = 2  # seconds between API calls (Groq is fast)
 _MAX_RETRIES = 3
 
-# Groq models (primary) — ordered by capability/speed balance
+# Groq models (primary) — ordered by capability, diversified to spread rate limits
+# Each model has its own TPM/RPM quota on free tier, so more models = more headroom
 _GROQ_MODELS = [
-    "llama-3.3-70b-versatile",      # Best quality, 280 t/s
-    "qwen/qwen3-32b",               # Good quality, 500K TPM free
-    "meta-llama/llama-4-scout-17b-16e-instruct",  # Fast, 750 t/s
-    "llama-3.1-8b-instant",          # Fastest fallback, 560 t/s
+    "llama-3.3-70b-versatile",      # Best quality, 6K TPM free
+    "qwen/qwen3-32b",               # Good quality, 6K TPM free
+    "gemma2-9b-it",                  # 15K TPM free (highest!), solid quality
+    "meta-llama/llama-4-scout-17b-16e-instruct",  # Fast, 6K TPM free
+    "mistral-saba-24b",             # Mistral quality, 6K TPM free
+    "llama-3.1-8b-instant",          # Fastest fallback, 14.4K RPD
 ]
 
 # Gemini models (fallback only)
