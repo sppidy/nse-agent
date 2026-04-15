@@ -1,5 +1,5 @@
 """
-News sentiment engine — fetches market news and analyzes mood using Gemini.
+News sentiment engine — fetches market news and analyzes mood using AI (Groq/Gemini).
 
 Sources (all free, no API key needed):
 - Google News RSS for company-specific news
@@ -306,7 +306,7 @@ def fetch_all_news(symbols: list[str] | None = None) -> dict:
 
 
 def format_news_for_ai(news_data: dict) -> str:
-    """Format news data into a text summary for Gemini analysis."""
+    """Format news data into a text summary for AI analysis."""
     text = "LATEST NEWS (last 3 days):\n\n"
 
     # Market news
@@ -329,10 +329,9 @@ def format_news_for_ai(news_data: dict) -> str:
 
 
 def analyze_sentiment(news_data: dict) -> dict:
-    """Use Gemini to analyze overall market and per-stock sentiment."""
-    from ai_strategy import _get_client, _call_gemini
+    """Use AI (Groq/Gemini) to analyze overall market and per-stock sentiment."""
+    from ai_strategy import _call_gemini
 
-    client = _get_client()
     news_text = format_news_for_ai(news_data)
 
     symbols = list(news_data.get("stocks", {}).keys())
@@ -368,7 +367,7 @@ Respond ONLY with valid JSON (no markdown):
 Include entries for these stocks: {symbols_json}"""
 
     try:
-        text = _call_gemini(client, prompt)
+        text = _call_gemini(None, prompt)
         if text.startswith("```"):
             text = text.split("\n", 1)[1]
             text = text.rsplit("```", 1)[0]
