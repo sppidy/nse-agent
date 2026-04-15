@@ -1,4 +1,4 @@
-"""AI-powered trading strategy — Copilot/Haiku -> OpenRouter -> Groq -> Gemini."""
+"""AI-powered trading strategy — Copilot/Haiku -> OpenRouter -> Groq -> Cloudflare -> Gemini."""
 
 import os
 import json
@@ -44,6 +44,16 @@ _GROQ_MODELS = [
     "meta-llama/llama-4-scout-17b-16e-instruct",  # Fast, 6K TPM free
     "mistral-saba-24b",             # Mistral quality, 6K TPM free
     "llama-3.1-8b-instant",          # Fastest fallback, 14.4K RPD
+]
+
+# Cloudflare Workers AI (OpenAI-compatible, 10K neurons/day free)
+_CLOUDFLARE_ACCOUNT_ID = "809387d76a2179b664ffa0d0fe703719"
+_CLOUDFLARE_URL = f"https://api.cloudflare.com/client/v4/accounts/{_CLOUDFLARE_ACCOUNT_ID}/ai/v1"
+_CLOUDFLARE_MODELS = [
+    "@cf/meta/llama-3.3-70b-instruct-fp8-fast",  # Best quality, function calling
+    "@cf/qwen/qwen3-30b-a3b-fp8",                # Strong reasoning
+    "@cf/mistralai/mistral-small-3.1-24b-instruct",  # Reliable structured output
+    "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",  # Good analysis
 ]
 
 # Gemini models (fallback only)
@@ -244,6 +254,67 @@ async def _call_groq_async(prompt: str, retries: int = _MAX_RETRIES, want_json: 
     raise Exception("All Groq models exhausted")
 
 
+async def _call_cloudflare_async(prompt: str, retries: int = _MAX_RETRIES, want_json: bool = False) -> str | list[SignalSchema]:
+    """Call Cloudflare Workers AI (OpenAI-compatible)."""
+    import httpx
+
+    api_token = os.getenv("CLOUDFLARE_API_TOKEN")
+    if not api_token:
+        raise Exception("CLOUDFLARE_API_TOKEN not set")
+
+    for model in _CLOUDFLARE_MODELS:
+        for attempt in range(retries):
+            try:
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3,
+                    "max_tokens": 4096,
+                }
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    resp = await client.post(
+                        f"{_CLOUDFLARE_URL}/chat/completions",
+                        json=payload,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {api_token}",
+                        },
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+
+                text = data["choices"][0]["message"]["content"].strip()
+
+                if want_json:
+                    signals = _parse_signals_from_text(text)
+                    if signals:
+                        logger.info(f"    Cloudflare/{model}: parsed {len(signals)} signals")
+                        return signals
+                    logger.warning(f"    Cloudflare/{model}: didn't yield signals, trying next model")
+                    break
+                return text
+            except Exception as e:
+                error_str = str(e)
+                if "429" in error_str or "rate" in error_str.lower() or "neuron" in error_str.lower():
+                    if attempt < retries - 1:
+                        wait = _MIN_DELAY_BETWEEN_CALLS * (attempt + 2)
+                        logger.warning(f"    Cloudflare/{model} rate limited, waiting {wait}s...")
+                        await asyncio.sleep(wait)
+                    else:
+                        logger.warning(f"    Cloudflare/{model} exhausted retries, trying next model...")
+                        break
+                elif "404" in error_str or "not_found" in error_str.lower():
+                    logger.warning(f"    Cloudflare/{model} not found, trying next model...")
+                    break
+                else:
+                    logger.warning(f"    Cloudflare/{model} error: {e}")
+                    if attempt < retries - 1:
+                        await asyncio.sleep(_MIN_DELAY_BETWEEN_CALLS)
+                    else:
+                        break
+    raise Exception("All Cloudflare models exhausted")
+
+
 async def _call_copilot_async(prompt: str, retries: int = _MAX_RETRIES, want_json: bool = False) -> str | list[SignalSchema]:
     """Call Claude Haiku via Copilot proxy (OpenAI-compatible)."""
     import httpx
@@ -419,7 +490,7 @@ async def _call_gemini_async(client, prompt: str, retries: int = _MAX_RETRIES, r
 
 
 async def _call_ai_async(prompt: str, want_json: bool = False) -> str | list[SignalSchema]:
-    """Copilot/Haiku -> OpenRouter -> Groq -> Gemini."""
+    """Copilot/Haiku -> OpenRouter -> Groq -> Cloudflare -> Gemini."""
     # 1. Copilot proxy (Claude Haiku via GitHub Copilot — free, smart)
     try:
         return await _call_copilot_async(prompt, want_json=want_json)
@@ -438,9 +509,16 @@ async def _call_ai_async(prompt: str, want_json: bool = False) -> str | list[Sig
         try:
             return await _call_groq_async(prompt, want_json=want_json)
         except Exception as e:
-            logger.warning(f"    Groq failed, falling back to Gemini: {e}")
+            logger.warning(f"    Groq failed, trying Cloudflare: {e}")
 
-    # 4. Gemini (final fallback)
+    # 4. Cloudflare Workers AI (10K neurons/day free)
+    if os.getenv("CLOUDFLARE_API_TOKEN"):
+        try:
+            return await _call_cloudflare_async(prompt, want_json=want_json)
+        except Exception as e:
+            logger.warning(f"    Cloudflare failed, falling back to Gemini: {e}")
+
+    # 5. Gemini (final fallback)
     gemini_client = _get_gemini_client()
     if gemini_client:
         schema = list[SignalSchema] if want_json else None
