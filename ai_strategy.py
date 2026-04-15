@@ -1,4 +1,4 @@
-"""AI-powered trading strategy using Groq (primary) and Gemini (fallback)."""
+"""AI-powered trading strategy using Groq (primary), Copilot/Haiku, and Gemini (fallback)."""
 
 import os
 import json
@@ -19,6 +19,13 @@ load_dotenv()
 # Rate limiting
 _MIN_DELAY_BETWEEN_CALLS = 2  # seconds between API calls (Groq is fast)
 _MAX_RETRIES = 3
+
+# Copilot proxy (GitHub Copilot -> OpenAI-compatible API on localhost)
+_COPILOT_PROXY_URL = os.getenv("COPILOT_PROXY_URL", "http://localhost:4141/v1")
+_COPILOT_MODELS = [
+    "claude-haiku-4.5",    # Fast, smart, free via Copilot
+    "gpt-4o-mini",         # Cheap fallback
+]
 
 # Groq models (primary) — ordered by capability, diversified to spread rate limits
 # Each model has its own TPM/RPM quota on free tier, so more models = more headroom
@@ -229,6 +236,60 @@ async def _call_groq_async(prompt: str, retries: int = _MAX_RETRIES, want_json: 
     raise Exception("All Groq models exhausted")
 
 
+async def _call_copilot_async(prompt: str, retries: int = _MAX_RETRIES, want_json: bool = False) -> str | list[SignalSchema]:
+    """Call Claude Haiku via Copilot proxy (OpenAI-compatible)."""
+    import httpx
+
+    for model in _COPILOT_MODELS:
+        for attempt in range(retries):
+            try:
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3,
+                    "max_tokens": 4096,
+                }
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    resp = await client.post(
+                        f"{_COPILOT_PROXY_URL}/chat/completions",
+                        json=payload,
+                        headers={"Content-Type": "application/json"},
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+
+                text = data["choices"][0]["message"]["content"].strip()
+
+                if want_json:
+                    signals = _parse_signals_from_text(text)
+                    if signals:
+                        logger.info(f"    Copilot/{model}: parsed {len(signals)} signals")
+                        return signals
+                    logger.warning(f"    Copilot/{model}: didn't yield signals, trying next model")
+                    break
+                return text
+            except Exception as e:
+                error_str = str(e)
+                if "429" in error_str or "rate" in error_str.lower():
+                    if attempt < retries - 1:
+                        wait = _MIN_DELAY_BETWEEN_CALLS * (attempt + 2)
+                        logger.warning(f"    Copilot/{model} rate limited, waiting {wait}s...")
+                        await asyncio.sleep(wait)
+                    else:
+                        logger.warning(f"    Copilot/{model} exhausted retries, trying next model...")
+                        break
+                elif "connect" in error_str.lower() or "refused" in error_str.lower():
+                    logger.warning(f"    Copilot proxy unavailable: {e}")
+                    raise Exception("Copilot proxy not running")
+                else:
+                    logger.warning(f"    Copilot/{model} error: {e}")
+                    if attempt < retries - 1:
+                        await asyncio.sleep(_MIN_DELAY_BETWEEN_CALLS)
+                    else:
+                        break
+    raise Exception("All Copilot models exhausted")
+
+
 async def _call_gemini_async(client, prompt: str, retries: int = _MAX_RETRIES, response_schema=None) -> str | list[SignalSchema]:
     """Call Gemini with model fallback and retry on rate limits (fallback)."""
     from google.genai import types
@@ -286,15 +347,21 @@ async def _call_gemini_async(client, prompt: str, retries: int = _MAX_RETRIES, r
 
 
 async def _call_ai_async(prompt: str, want_json: bool = False) -> str | list[SignalSchema]:
-    """Call Groq first, fall back to Gemini if Groq fails."""
-    # Try Groq first (fast)
+    """Call Groq first, then Copilot/Haiku, then Gemini as final fallback."""
+    # Try Groq first (fast, free)
     if os.getenv("GROQ_API_KEY"):
         try:
             return await _call_groq_async(prompt, want_json=want_json)
         except Exception as e:
-            logger.warning(f"    Groq failed, falling back to Gemini: {e}")
+            logger.warning(f"    Groq failed, trying Copilot: {e}")
 
-    # Fallback to Gemini
+    # Try Copilot proxy (Claude Haiku via GitHub Copilot)
+    try:
+        return await _call_copilot_async(prompt, want_json=want_json)
+    except Exception as e:
+        logger.warning(f"    Copilot failed, falling back to Gemini: {e}")
+
+    # Final fallback: Gemini
     gemini_client = _get_gemini_client()
     if gemini_client:
         schema = list[SignalSchema] if want_json else None
