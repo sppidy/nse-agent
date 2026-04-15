@@ -14,8 +14,8 @@ from market_calendar import is_market_trading_day
 
 
 def cmd_ai_scan():
-    """Use Gemini AI to analyze watchlist stocks."""
-    print(f"\n[AI] Analyzing {len(config.WATCHLIST)} stocks with Gemini...\n")
+    """Use AI (Groq/Gemini) to analyze watchlist stocks."""
+    print(f"\n[AI] Analyzing {len(config.WATCHLIST)} stocks with AI...\n")
     signals = analyze_watchlist()
 
     for sig in signals:
@@ -42,7 +42,7 @@ def cmd_ai_trade():
         return
 
     trader = PaperTrader()
-    print("\n[AI] Running Gemini-powered trading cycle...\n")
+    print("\n[AI] Running AI-powered trading cycle...\n")
 
     # Get current prices
     prices = get_watchlist_prices()
@@ -310,10 +310,10 @@ AI Trading Agent — Paper Trading System
 
 Commands:
   scan      Scan watchlist for BUY/SELL signals (RSI+EMA)
-  ai-scan   Scan watchlist using Gemini AI analysis
+  ai-scan   Scan watchlist using AI (Groq/Gemini) analysis
   backtest  Run backtest on historical data
   trade     Execute one trading cycle (RSI+EMA rules)
-  ai-trade  Execute one AI-powered trading cycle (Gemini)
+  ai-trade  Execute one AI-powered trading cycle (Groq/Gemini)
   autopilot Run AI bot all day (auto-trades during market hours)
   chat      Interactive chat with your AI trading agent
   news      Fetch & analyze news sentiment for all stocks

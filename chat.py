@@ -294,7 +294,7 @@ def build_system_prompt() -> str:
 Config: Rs.{config.INITIAL_CAPITAL} capital, {config.MAX_POSITION_SIZE_PCT*100}%/pos, {config.MAX_OPEN_POSITIONS} max pos, SL:{config.STOP_LOSS_PCT*100}%, TP:{config.TAKE_PROFIT_PCT*100}%
 Watchlist: {','.join(s.replace('.NS','') for s in config.WATCHLIST)}
 
-System runs: Technicals(RSI14,EMA9/21)+AI(Gemini)+News(GoogleNews,Yahoo,Twitter/X,ET,Moneycontrol)+ML(GradientBoosting,observing<55%acc)+TradeHistory. Confidence>60% to trade.
+System runs: Technicals(RSI14,EMA9/21)+AI(Groq/Gemini)+News(GoogleNews,Yahoo,Twitter/X,ET,Moneycontrol)+ML(GradientBoosting,observing)+TradeHistory. Confidence>60% to trade.
 
 Rules: Be concise(<150 words). Use Rs. Use provided data only. For buy/sell tell user: buy SYMBOL [qty]. Mention risks. Use markdown. You DO use news sentiment from 5 sources actively."""
 
