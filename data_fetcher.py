@@ -70,10 +70,16 @@ def get_live_price(symbol: str) -> float | None:
     """Get the latest available price for a symbol."""
     try:
         ticker = yf.Ticker(symbol)
-        info = ticker.fast_info
-        live = _clean_price(info.get("lastPrice") if info is not None else None)
-        if live is not None:
-            return live
+        try:
+            info = ticker.fast_info
+            if info is not None:
+                # fast_info may be a dict-like or object — handle both
+                last = getattr(info, 'lastPrice', None) or (info.get("lastPrice") if hasattr(info, 'get') else None)
+                live = _clean_price(last)
+                if live is not None:
+                    return live
+        except Exception:
+            pass
         hist = ticker.history(period="1d")
         if not hist.empty:
             return _clean_price(hist["Close"].iloc[-1])
