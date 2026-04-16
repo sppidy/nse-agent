@@ -1,14 +1,15 @@
 """
-Local ML predictor — trains on historical data to predict price direction.
+CatBoost ML predictor — trained on 5 years of daily data for 210+ NSE stocks.
 
-Uses scikit-learn (lightweight, no GPU needed) to train a model that predicts
-whether a stock will go UP or DOWN in the next trading session, based on
-technical indicators.
+Predicts whether a stock will move up ≥2% within the next 5 trading days,
+based on 45+ technical features (RSI, EMA, MACD, Bollinger, ATR, Stochastic,
+ADX, multi-period returns, volatility, volume, price action, support/resistance).
 
-The model improves over time as more data is collected from paper trading.
+Model is trained in Google Colab (GPU) and deployed here for inference.
 """
 
 import os
+import json
 import pickle
 import hashlib
 import numpy as np
@@ -16,19 +17,57 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime, timezone
 
+import ta
 import config
 from logger import logger
 from persistence import read_json, write_json_atomic
-from strategy import add_indicators
 from data_fetcher import get_historical_data
 
 MODEL_DIR = os.path.join(config.PROJECT_DIR, "models")
 TRAINING_LOG = os.path.join(config.PROJECT_DIR, "training_log.json")
-MODEL_HASH_FILE = os.path.join(MODEL_DIR, "predictor.pkl.sha256")
+
+# Model files (Colab-trained CatBoost)
+MODEL_PKL = os.path.join(MODEL_DIR, "predictor_catboost.pkl")
+MODEL_CBM = os.path.join(MODEL_DIR, "predictor_catboost.cbm")
+MODEL_HASH_FILE = os.path.join(MODEL_DIR, "predictor_catboost.pkl.sha256")
+FEATURE_META = os.path.join(MODEL_DIR, "feature_cols.json")
+
+# Legacy model path (for backward compat)
+LEGACY_MODEL = os.path.join(MODEL_DIR, "predictor.pkl")
+LEGACY_HASH = os.path.join(MODEL_DIR, "predictor.pkl.sha256")
 
 
-def _ensure_model_dir():
-    os.makedirs(MODEL_DIR, exist_ok=True)
+FEATURE_COLS = [
+    # RSI
+    'rsi_14', 'rsi_7', 'rsi_21', 'rsi_change', 'rsi_change_3',
+    # EMA
+    'ema_diff_9_21', 'ema_diff_21_50', 'ema_diff_50_200',
+    'price_vs_ema9', 'price_vs_ema21', 'price_vs_ema50', 'price_vs_ema200',
+    # MACD
+    'macd', 'macd_signal', 'macd_diff', 'macd_diff_change',
+    # Bollinger
+    'bb_width', 'bb_position',
+    # ATR
+    'atr', 'atr_7',
+    # Stochastic
+    'stoch_k', 'stoch_d', 'stoch_diff',
+    # ADX
+    'adx', 'adx_diff',
+    # Returns
+    'return_1', 'return_3', 'return_5', 'return_10', 'return_20',
+    # Volatility
+    'volatility_5', 'volatility_10', 'volatility_20', 'vol_ratio_5_20',
+    # Volume
+    'volume_ratio', 'volume_change', 'volume_trend',
+    # Price action
+    'high_low_range', 'close_position', 'upper_wick', 'lower_wick', 'body_size',
+    # Support/Resistance
+    'dist_to_high_20', 'dist_to_low_20', 'dist_to_high_50', 'dist_to_low_50',
+    # Divergence
+    'rsi_divergence',
+    # Time
+    'dow_sin', 'dow_cos',
+]
 
 
 def _sha256_file(path: str) -> str:
@@ -51,113 +90,230 @@ def get_latest_training_metrics() -> dict | None:
 
 
 def should_retrain(min_hours: int = 18) -> tuple[bool, str]:
-    """Return retrain decision and reason based on training recency."""
-    log = _get_training_log()
-    if not log:
-        return True, "No previous training log"
-    last_ts = log[-1].get("timestamp")
-    if not last_ts:
-        return True, "Missing last training timestamp"
-    try:
-        last_dt = datetime.fromisoformat(last_ts)
-        if last_dt.tzinfo is None:
-            last_dt = last_dt.replace(tzinfo=timezone.utc)
-    except ValueError:
-        return True, "Invalid last training timestamp"
-    now = datetime.now(timezone.utc)
-    elapsed_hours = (now - last_dt).total_seconds() / 3600
-    if elapsed_hours >= min_hours:
-        return True, f"{elapsed_hours:.1f}h elapsed since last training"
-    return False, f"Only {elapsed_hours:.1f}h since last training"
-
-
-def _resolve_training_n_jobs() -> int:
-    """Resolve job count for model search; keep default conservative for stability."""
-    raw = os.environ.get("ML_TRAIN_N_JOBS", "1").strip()
-    try:
-        jobs = int(raw)
-    except ValueError:
-        logger.warning(f"Invalid ML_TRAIN_N_JOBS='{raw}', falling back to 1")
-        return 1
-
-    if jobs == 0 or jobs < -1:
-        logger.warning(f"Unsupported ML_TRAIN_N_JOBS='{raw}', falling back to 1")
-        return 1
-    return jobs
+    """CatBoost model is trained in Colab — local retraining not needed."""
+    if not os.path.exists(MODEL_PKL) and not os.path.exists(MODEL_CBM):
+        return True, "No CatBoost model found — train in Colab and upload"
+    return False, "CatBoost model loaded (Colab-trained)"
 
 
 def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Create feature matrix from OHLCV data."""
-    df = add_indicators(df).copy()
+    """Create 45+ features from daily OHLCV data — matches Colab training exactly."""
+    df = df.copy()
+    close = df['Close']
+    high = df['High']
+    low = df['Low']
+    volume = df['Volume']
 
-    # Price-based features
-    df["return_1d"] = df["Close"].pct_change()
-    df["return_3d"] = df["Close"].pct_change(3)
-    df["return_5d"] = df["Close"].pct_change(5)
-    df["high_low_range"] = (df["High"] - df["Low"]) / df["Close"]
-    df["close_vs_high"] = (df["Close"] - df["Low"]) / (df["High"] - df["Low"] + 1e-8)
+    # RSI (multiple periods)
+    df['rsi_14'] = ta.momentum.RSIIndicator(close, window=14).rsi()
+    df['rsi_7'] = ta.momentum.RSIIndicator(close, window=7).rsi()
+    df['rsi_21'] = ta.momentum.RSIIndicator(close, window=21).rsi()
+    df['rsi_change'] = df['rsi_14'].diff()
+    df['rsi_change_3'] = df['rsi_14'].diff(3)
+
+    # EMAs
+    df['ema_9'] = ta.trend.EMAIndicator(close, window=9).ema_indicator()
+    df['ema_21'] = ta.trend.EMAIndicator(close, window=21).ema_indicator()
+    df['ema_50'] = ta.trend.EMAIndicator(close, window=50).ema_indicator()
+    df['ema_100'] = ta.trend.EMAIndicator(close, window=100).ema_indicator()
+    df['ema_200'] = ta.trend.EMAIndicator(close, window=200).ema_indicator()
+    df['ema_diff_9_21'] = (df['ema_9'] - df['ema_21']) / close
+    df['ema_diff_21_50'] = (df['ema_21'] - df['ema_50']) / close
+    df['ema_diff_50_200'] = (df['ema_50'] - df['ema_200']) / close
+    df['price_vs_ema9'] = (close - df['ema_9']) / close
+    df['price_vs_ema21'] = (close - df['ema_21']) / close
+    df['price_vs_ema50'] = (close - df['ema_50']) / close
+    df['price_vs_ema200'] = (close - df['ema_200']) / close
+
+    # MACD
+    macd = ta.trend.MACD(close)
+    df['macd'] = macd.macd() / close
+    df['macd_signal'] = macd.macd_signal() / close
+    df['macd_diff'] = macd.macd_diff() / close
+    df['macd_diff_change'] = df['macd_diff'].diff()
+
+    # Bollinger Bands
+    bb = ta.volatility.BollingerBands(close)
+    df['bb_width'] = (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()
+    df['bb_position'] = (close - bb.bollinger_lband()) / (bb.bollinger_hband() - bb.bollinger_lband() + 1e-8)
+
+    # ATR
+    df['atr'] = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range() / close
+    df['atr_7'] = ta.volatility.AverageTrueRange(high, low, close, window=7).average_true_range() / close
+
+    # Stochastic
+    stoch = ta.momentum.StochasticOscillator(high, low, close)
+    df['stoch_k'] = stoch.stoch()
+    df['stoch_d'] = stoch.stoch_signal()
+    df['stoch_diff'] = df['stoch_k'] - df['stoch_d']
+
+    # ADX
+    adx = ta.trend.ADXIndicator(high, low, close, window=14)
+    df['adx'] = adx.adx()
+    df['adx_diff'] = adx.adx_pos() - adx.adx_neg()
+
+    # Returns
+    df['return_1'] = close.pct_change(1)
+    df['return_3'] = close.pct_change(3)
+    df['return_5'] = close.pct_change(5)
+    df['return_10'] = close.pct_change(10)
+    df['return_20'] = close.pct_change(20)
 
     # Volatility
-    df["volatility_5d"] = df["return_1d"].rolling(5).std()
-    df["volatility_20d"] = df["return_1d"].rolling(20).std()
+    df['volatility_5'] = df['return_1'].rolling(5).std()
+    df['volatility_10'] = df['return_1'].rolling(10).std()
+    df['volatility_20'] = df['return_1'].rolling(20).std()
+    df['vol_ratio_5_20'] = df['volatility_5'] / (df['volatility_20'] + 1e-8)
 
-    # Volume features
-    df["volume_ratio"] = df["Volume"] / df["Volume"].rolling(20).mean()
-    df["volume_change"] = df["Volume"].pct_change()
+    # Volume
+    vol_sma_20 = volume.rolling(20).mean()
+    df['volume_ratio'] = volume / (vol_sma_20 + 1)
+    df['volume_change'] = volume.pct_change()
+    df['volume_trend'] = volume.rolling(5).mean() / (volume.rolling(20).mean() + 1)
 
-    # EMA features
-    df["ema_diff"] = (df["ema_short"] - df["ema_long"]) / df["Close"]
-    df["price_vs_ema9"] = (df["Close"] - df["ema_short"]) / df["Close"]
-    df["price_vs_ema21"] = (df["Close"] - df["ema_long"]) / df["Close"]
+    # Price action
+    df['high_low_range'] = (high - low) / close
+    df['close_position'] = (close - low) / (high - low + 1e-8)
+    df['upper_wick'] = (high - np.maximum(close, df['Open'])) / (high - low + 1e-8)
+    df['lower_wick'] = (np.minimum(close, df['Open']) - low) / (high - low + 1e-8)
+    df['body_size'] = abs(close - df['Open']) / (high - low + 1e-8)
 
-    # RSI features
-    df["rsi_change"] = df["rsi"].diff()
-    
-    # New features (MACD, BB, ATR)
-    df["macd_norm"] = df["macd"] / df["Close"]
-    df["macd_diff_norm"] = df["macd_diff"] / df["Close"]
-    df["price_vs_bb_mid"] = (df["Close"] - df["bb_mid"]) / df["Close"]
-    df["atr_norm"] = df["atr"] / df["Close"]
+    # Support / Resistance
+    df['dist_to_high_20'] = (high.rolling(20).max() - close) / close
+    df['dist_to_low_20'] = (close - low.rolling(20).min()) / close
+    df['dist_to_high_50'] = (high.rolling(50).max() - close) / close
+    df['dist_to_low_50'] = (close - low.rolling(50).min()) / close
 
-    # Target: will price go up by more than 1% tomorrow? (filter out noise)
-    df["target"] = (df["Close"].shift(-1) > df["Close"] * 1.01).astype(int)
+    # RSI divergence
+    df['rsi_divergence'] = np.sign(close.diff(5)) * np.sign(-df['rsi_14'].diff(5))
+
+    # Day of week (cyclical)
+    if hasattr(df.index, 'dayofweek'):
+        df['dow_sin'] = np.sin(2 * np.pi * df.index.dayofweek / 5)
+        df['dow_cos'] = np.cos(2 * np.pi * df.index.dayofweek / 5)
+    else:
+        df['dow_sin'] = 0
+        df['dow_cos'] = 0
 
     return df
 
 
-FEATURE_COLS = [
-    "rsi", "rsi_change", "ema_diff", "price_vs_ema9", "price_vs_ema21",
-    "return_1d", "return_3d", "return_5d",
-    "high_low_range", "close_vs_high",
-    "volatility_5d", "volatility_20d",
-    "volume_ratio", "volume_change",
-    "macd_norm", "macd_diff_norm", "bb_width", "price_vs_bb_mid", "atr_norm"
-]
+def _load_model():
+    """Load the CatBoost model — try .cbm (native) first, then .pkl."""
+    # Try native CatBoost format first (faster, smaller)
+    if os.path.exists(MODEL_CBM):
+        try:
+            from catboost import CatBoostClassifier
+            model = CatBoostClassifier()
+            model.load_model(MODEL_CBM)
+            return model
+        except Exception as e:
+            logger.warning(f"Failed to load .cbm model: {e}")
+
+    # Fall back to pickle
+    if os.path.exists(MODEL_PKL):
+        if os.path.exists(MODEL_HASH_FILE):
+            expected = Path(MODEL_HASH_FILE).read_text(encoding="utf-8").strip()
+            actual = _sha256_file(MODEL_PKL)
+            if expected != actual:
+                logger.error("CatBoost model integrity check failed")
+                return None
+        with open(MODEL_PKL, "rb") as f:
+            return pickle.load(f)
+
+    # Legacy GradientBoosting model
+    if os.path.exists(LEGACY_MODEL):
+        logger.info("Loading legacy sklearn model (not CatBoost)")
+        if os.path.exists(LEGACY_HASH):
+            expected = Path(LEGACY_HASH).read_text(encoding="utf-8").strip()
+            actual = _sha256_file(LEGACY_MODEL)
+            if expected != actual:
+                return None
+        with open(LEGACY_MODEL, "rb") as f:
+            return pickle.load(f)
+
+    return None
 
 
-def train_model(symbols: list[str] | None = None, period: str = "1y") -> dict:
+# Cache the model in memory after first load
+_cached_model = None
+
+
+def predict(symbol: str, df: pd.DataFrame) -> dict:
+    """Predict whether a stock will go up ≥2% in the next 5 trading days."""
+    global _cached_model
+
+    if _cached_model is None:
+        _cached_model = _load_model()
+
+    if _cached_model is None:
+        return {"symbol": symbol, "error": "No model found. Train in Colab and upload to models/"}
+
+    features = prepare_features(df)
+    features = features.dropna(subset=FEATURE_COLS)
+    features = features.replace([np.inf, -np.inf], np.nan).dropna(subset=FEATURE_COLS)
+
+    if features.empty:
+        return {"symbol": symbol, "error": "Insufficient data for features"}
+
+    latest = features.iloc[-1:]
+    X = latest[FEATURE_COLS].values
+
+    try:
+        prob = _cached_model.predict_proba(X)[0]
+        prediction = "UP" if prob[1] > 0.5 else "DOWN"
+
+        return {
+            "symbol": symbol,
+            "prediction": prediction,
+            "confidence": round(float(max(prob)), 3),
+            "prob_up": round(float(prob[1]), 3),
+            "prob_down": round(float(prob[0]), 3),
+            "price": round(float(latest.iloc[0]["Close"]), 2),
+        }
+    except Exception as e:
+        return {"symbol": symbol, "error": f"Prediction failed: {e}"}
+
+
+def predict_watchlist(symbols: list[str] | None = None) -> list[dict]:
+    """Get predictions for all watchlist stocks."""
+    if symbols is None:
+        symbols = config.WATCHLIST
+
+    results = []
+    for symbol in symbols:
+        df = get_historical_data(symbol, period="1y", interval="1d")
+        if df.empty:
+            continue
+        result = predict(symbol, df)
+        results.append(result)
+
+    return results
+
+
+def train_model(symbols: list[str] | None = None, period: str = "5y") -> dict:
     """
-    Train a prediction model on historical data for watchlist stocks.
-    Returns training metrics.
+    Local training fallback — uses CatBoost if available, else sklearn.
+    For best results, train in Google Colab with GPU (train_catboost_colab.ipynb).
     """
-    from sklearn.base import clone
-    from sklearn.ensemble import GradientBoostingClassifier
-    from sklearn.model_selection import TimeSeriesSplit
-    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-
-    _ensure_model_dir()
+    os.makedirs(MODEL_DIR, exist_ok=True)
 
     if symbols is None:
         symbols = config.WATCHLIST
 
-    # Collect training data from all symbols
+    # Collect training data
     all_data = []
     for symbol in symbols:
         logger.info(f"  Fetching {symbol}...")
         df = get_historical_data(symbol, period=period, interval="1d")
-        if df.empty or len(df) < 30:
+        if df.empty or len(df) < 50:
             continue
         features = prepare_features(df)
+
+        # Target: 2% up in next 5 days
+        future_max = features['High'].rolling(5).max().shift(-5)
+        features['target'] = (future_max >= features['Close'] * 1.02).astype(int)
+
         features["symbol"] = symbol
         all_data.append(features)
 
@@ -168,206 +324,91 @@ def train_model(symbols: list[str] | None = None, period: str = "1y") -> dict:
     combined = combined.dropna(subset=FEATURE_COLS + ["target"])
     combined = combined.replace([np.inf, -np.inf], np.nan).dropna(subset=FEATURE_COLS)
 
-    if len(combined) < 50:
-        return {"error": f"Only {len(combined)} samples, need at least 50"}
+    if len(combined) < 100:
+        return {"error": f"Only {len(combined)} samples, need at least 100"}
 
     X = combined[FEATURE_COLS].values
     y = combined["target"].values
 
-    # Time-series cross-validation (no data leakage)
-    tscv = TimeSeriesSplit(n_splits=3)
-    
-    # Hyperparameter tuning
-    from sklearn.model_selection import RandomizedSearchCV
-    
-    param_dist = {
-        'n_estimators': [50, 100, 200],
-        'max_depth': [3, 4, 5],
-        'learning_rate': [0.01, 0.05, 0.1, 0.2],
-        'min_samples_leaf': [5, 10, 20]
-    }
-    
-    base_model = GradientBoostingClassifier(random_state=42)
-    search_jobs = _resolve_training_n_jobs()
-    random_search = RandomizedSearchCV(
-        estimator=base_model,
-        param_distributions=param_dist,
-        n_iter=10,
-        cv=tscv,
-        scoring='f1',
-        random_state=42,
-        n_jobs=search_jobs
-    )
-    
-    logger.info(f"  Tuning hyperparameters... (n_jobs={search_jobs})")
-    random_search.fit(X, y)
-    
-    final_model = random_search.best_estimator_
-    best_params = random_search.best_params_
-    
-    # Get CV scores of the best model
-    best_index = random_search.best_index_
-    scores = [
-        random_search.cv_results_[f'split{i}_test_score'][best_index]
-        for i in range(tscv.n_splits)
-    ]
-
-    # Walk-forward out-of-fold metrics with best tuned parameters
-    oof_true = []
-    oof_pred = []
-    for train_idx, test_idx in tscv.split(X):
-        fold_model = clone(final_model)
-        fold_model.fit(X[train_idx], y[train_idx])
-        preds = fold_model.predict(X[test_idx])
-        oof_true.extend(y[test_idx].tolist())
-        oof_pred.extend(preds.tolist())
-
-    oof_accuracy = accuracy_score(oof_true, oof_pred) if oof_true else 0.0
-    oof_precision = precision_score(oof_true, oof_pred, zero_division=0) if oof_true else 0.0
-    oof_recall = recall_score(oof_true, oof_pred, zero_division=0) if oof_true else 0.0
-    oof_f1 = f1_score(oof_true, oof_pred, zero_division=0) if oof_true else 0.0
-    class_balance_up = float(np.mean(y)) if len(y) > 0 else 0.0
-    naive_baseline = max(class_balance_up, 1 - class_balance_up)
-
-    # Final chronological holdout evaluation (live-like split).
+    # Chronological split
     split_idx = int(len(X) * 0.85)
-    holdout_accuracy = holdout_precision = holdout_recall = holdout_f1 = 0.0
-    if split_idx > 30 and split_idx < len(X) - 5:
-        final_model.fit(X[:split_idx], y[:split_idx])
-        holdout_pred = final_model.predict(X[split_idx:])
-        y_holdout = y[split_idx:]
-        holdout_accuracy = accuracy_score(y_holdout, holdout_pred)
-        holdout_precision = precision_score(y_holdout, holdout_pred, zero_division=0)
-        holdout_recall = recall_score(y_holdout, holdout_pred, zero_division=0)
-        holdout_f1 = f1_score(y_holdout, holdout_pred, zero_division=0)
-    else:
-        # Fallback to full-fit when split is not reliable for tiny datasets.
-        final_model.fit(X, y)
+    X_train, X_test = X[:split_idx], X[split_idx:]
+    y_train, y_test = y[:split_idx], y[split_idx:]
 
-    # Refit on full data for deployment after validation metrics are computed.
-    final_model.fit(X, y)
+    try:
+        from catboost import CatBoostClassifier
+        model = CatBoostClassifier(
+            iterations=1000,
+            depth=6,
+            learning_rate=0.05,
+            l2_leaf_reg=3,
+            bootstrap_type='Bernoulli',
+            subsample=0.8,
+            min_data_in_leaf=20,
+            loss_function='Logloss',
+            eval_metric='Logloss',
+            random_seed=42,
+            early_stopping_rounds=100,
+            verbose=100,
+        )
+        logger.info(f"  Training CatBoost on {len(X_train):,} samples...")
+        model.fit(X_train, y_train, eval_set=(X_test, y_test))
+        model_type = "catboost"
+    except ImportError:
+        from sklearn.ensemble import GradientBoostingClassifier
+        logger.info(f"  CatBoost not available, using sklearn GradientBoosting...")
+        model = GradientBoostingClassifier(
+            n_estimators=200, max_depth=5, learning_rate=0.05,
+            min_samples_leaf=20, random_state=42,
+        )
+        model.fit(X_train, y_train)
+        model_type = "sklearn"
 
-    # Feature importance
-    importance = dict(zip(FEATURE_COLS, final_model.feature_importances_))
-    top_features = sorted(importance.items(), key=lambda x: x[1], reverse=True)[:5]
+    # Evaluate
+    from sklearn.metrics import accuracy_score, f1_score, precision_score
+    y_pred = model.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred, zero_division=0)
+    precision = precision_score(y_test, y_pred, zero_division=0)
 
-    model_path = os.path.join(MODEL_DIR, "predictor.pkl")
-    prev_metrics = get_latest_training_metrics() or {}
-    prev_f1 = float(prev_metrics.get("walk_forward_f1", 0))
-    prev_holdout_f1 = float(prev_metrics.get("holdout_f1", 0))
+    # Save
+    model_path = MODEL_PKL if model_type == "catboost" else LEGACY_MODEL
+    with open(model_path, "wb") as f:
+        pickle.dump(model, f)
+    model_hash = _sha256_file(model_path)
+    hash_path = MODEL_HASH_FILE if model_type == "catboost" else LEGACY_HASH
+    with open(hash_path, "w", encoding="utf-8") as f:
+        f.write(model_hash)
 
-    promote_model = True
-    promote_reason = "No previous model baseline"
-    if prev_metrics:
-        if (oof_f1 * 100) + 0.5 < prev_f1 and (holdout_f1 * 100) + 0.5 < prev_holdout_f1:
-            promote_model = False
-            promote_reason = "Candidate underperforms previous model on both walk-forward and holdout F1"
-        else:
-            promote_reason = "Candidate is stable/improved vs previous model"
+    if model_type == "catboost":
+        model.save_model(MODEL_CBM)
 
-    model_hash = ""
-    if promote_model or not os.path.exists(model_path):
-        with open(model_path, "wb") as f:
-            pickle.dump(final_model, f)
-        model_hash = _sha256_file(model_path)
-        with open(MODEL_HASH_FILE, "w", encoding="utf-8") as f:
-            f.write(model_hash)
-        promote_model = True
-    else:
-        model_hash = prev_metrics.get("model_sha256", "")
+    # Clear cached model so next predict() loads the new one
+    global _cached_model
+    _cached_model = None
 
     metrics = {
         "samples": len(combined),
         "symbols": len(all_data),
-        "cv_accuracy": round(np.mean(scores) * 100, 1),
-        "cv_scores": [round(s * 100, 1) for s in scores],
-        "walk_forward_accuracy": round(oof_accuracy * 100, 1),
-        "walk_forward_precision": round(oof_precision * 100, 1),
-        "walk_forward_recall": round(oof_recall * 100, 1),
-        "walk_forward_f1": round(oof_f1 * 100, 1),
-        "holdout_accuracy": round(holdout_accuracy * 100, 1),
-        "holdout_precision": round(holdout_precision * 100, 1),
-        "holdout_recall": round(holdout_recall * 100, 1),
-        "holdout_f1": round(holdout_f1 * 100, 1),
-        "baseline_accuracy": round(naive_baseline * 100, 1),
-        "up_class_ratio": round(class_balance_up * 100, 1),
-        "top_features": {k: round(v, 3) for k, v in top_features},
+        "model_type": model_type,
+        "holdout_accuracy": round(accuracy * 100, 1),
+        "holdout_f1": round(f1 * 100, 1),
+        "holdout_precision": round(precision * 100, 1),
         "model_path": model_path,
         "model_sha256": model_hash,
-        "model_promoted": promote_model,
-        "promotion_reason": promote_reason,
-        "best_params": best_params,
     }
 
-    # Save training log
     log = _get_training_log()
-    log.append({
-        "timestamp": pd.Timestamp.now().isoformat(),
-        "metrics": metrics,
-    })
+    log.append({"timestamp": pd.Timestamp.now().isoformat(), "metrics": metrics})
     write_json_atomic(TRAINING_LOG, log)
 
     return metrics
 
 
-def predict(symbol: str, df: pd.DataFrame) -> dict:
-    """Predict whether a stock will go up or down tomorrow."""
-    model_path = os.path.join(MODEL_DIR, "predictor.pkl")
-    if not os.path.exists(model_path):
-        return {"symbol": symbol, "error": "No trained model. Run: python main.py train"}
-    if not os.path.exists(MODEL_HASH_FILE):
-        return {"symbol": symbol, "error": "Model integrity file missing. Re-train model."}
-
-    expected_hash = Path(MODEL_HASH_FILE).read_text(encoding="utf-8").strip()
-    actual_hash = _sha256_file(model_path)
-    if expected_hash != actual_hash:
-        return {"symbol": symbol, "error": "Model integrity check failed. Re-train model."}
-
-    with open(model_path, "rb") as f:
-        model = pickle.load(f)
-
-    features = prepare_features(df)
-    features = features.dropna(subset=FEATURE_COLS)
-
-    if features.empty:
-        return {"symbol": symbol, "error": "Insufficient data"}
-
-    latest = features.iloc[-1:]
-    X = latest[FEATURE_COLS].values
-
-    prob = model.predict_proba(X)[0]
-    prediction = "UP" if prob[1] > 0.5 else "DOWN"
-
-    return {
-        "symbol": symbol,
-        "prediction": prediction,
-        "confidence": round(float(max(prob)), 3),
-        "prob_up": round(float(prob[1]), 3),
-        "prob_down": round(float(prob[0]), 3),
-        "price": round(float(latest.iloc[0]["Close"]), 2),
-    }
-
-
-def predict_watchlist(symbols: list[str] | None = None) -> list[dict]:
-    """Get predictions for all watchlist stocks."""
-    if symbols is None:
-        symbols = config.WATCHLIST
-
-    results = []
-    for symbol in symbols:
-        df = get_historical_data(symbol, period="60d", interval="1d")
-        if df.empty:
-            continue
-        result = predict(symbol, df)
-        results.append(result)
-
-    return results
-
-
 def print_predictions(predictions: list[dict]):
     """Print formatted predictions."""
     print(f"\n{'='*60}")
-    print(f"  ML PREDICTIONS (Next Trading Day)")
+    print(f"  ML PREDICTIONS — CatBoost (≥2% in 5 days)")
     print(f"{'='*60}")
 
     for p in predictions:
