@@ -57,21 +57,45 @@ def log_trade(
     return entry
 
 
-def record_outcome(symbol: str, exit_price: float, pnl: float, pnl_pct: float):
-    """Record the outcome of a closed trade."""
+def record_outcome(
+    symbol: str,
+    exit_price: float,
+    pnl: float,
+    pnl_pct: float,
+    entry_time: str | None = None,
+):
+    """Record the outcome of a closed trade.
+
+    If `entry_time` is provided, match that exact BUY. Otherwise match the
+    OLDEST unmatched BUY (FIFO) — this is the correct accounting when a
+    symbol has been averaged-up before being closed.
+    """
     journal = _load_json(JOURNAL_FILE)
 
-    # Find the most recent BUY for this symbol that has no outcome
-    for entry in reversed(journal):
-        if entry["symbol"] == symbol and entry["action"] == "BUY" and entry["outcome"] is None:
-            entry["outcome"] = {
-                "exit_price": exit_price,
-                "pnl": round(pnl, 2),
-                "pnl_pct": round(pnl_pct, 2),
-                "exit_time": datetime.now().isoformat(),
-                "result": "WIN" if pnl > 0 else "LOSS",
-            }
-            break
+    target = None
+    if entry_time:
+        for entry in journal:
+            if (entry["symbol"] == symbol and entry["action"] == "BUY"
+                    and entry["outcome"] is None
+                    and entry.get("timestamp") == entry_time):
+                target = entry
+                break
+
+    if target is None:
+        # FIFO fallback: oldest unmatched BUY for this symbol.
+        for entry in journal:
+            if entry["symbol"] == symbol and entry["action"] == "BUY" and entry["outcome"] is None:
+                target = entry
+                break
+
+    if target is not None:
+        target["outcome"] = {
+            "exit_price": exit_price,
+            "pnl": round(pnl, 2),
+            "pnl_pct": round(pnl_pct, 2),
+            "exit_time": datetime.now().isoformat(),
+            "result": "WIN" if pnl > 0 else "LOSS",
+        }
 
     _save_json(JOURNAL_FILE, journal)
 

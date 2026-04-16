@@ -109,6 +109,7 @@ def _normalize_signal_record(raw: dict | SignalSchema, symbol: str, fallback_pri
         except (TypeError, ValueError):
             return None
 
+    from datetime import datetime, timezone
     return {
         "symbol": symbol,
         "signal": signal,
@@ -119,6 +120,7 @@ def _normalize_signal_record(raw: dict | SignalSchema, symbol: str, fallback_pri
         "target": _safe_num(raw.get("target")),
         "position_size_pct": position_size_pct,
         "price": float(fallback_price),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -665,20 +667,22 @@ async def analyze_batch_async(stock_data: list[tuple[str, pd.DataFrame]]) -> lis
     learning = await asyncio.to_thread(get_learning_context)
 
     from news_sentiment import get_sentiment_context
-    news_context = await asyncio.to_thread(get_sentiment_context, symbols)
+    try:
+        news_context = await asyncio.wait_for(
+            asyncio.to_thread(get_sentiment_context, symbols),
+            timeout=15.0,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("    [NEWS] Sentiment fetch timed out (>15s); proceeding with neutral sentiment.")
+        news_context = "NEWS SENTIMENT ANALYSIS: Timed out — treat all symbols as NEUTRAL sentiment."
+    except Exception as exc:
+        logger.warning(f"    [NEWS] Sentiment fetch failed ({exc}); proceeding with neutral sentiment.")
+        news_context = "NEWS SENTIMENT ANALYSIS: Unavailable — treat all symbols as NEUTRAL sentiment."
+
     if not str(news_context).startswith("NEWS SENTIMENT ANALYSIS:"):
-        reason = f"Sentiment analysis unavailable; trade decisions blocked ({news_context})"
-        logger.error(f"    {reason}")
-        return [
-            {
-                "symbol": sym,
-                "signal": "HOLD",
-                "confidence": 0.0,
-                "reason": reason,
-                "price": price_map.get(sym, 0.0),
-            }
-            for sym, _ in stock_data
-        ]
+        # Still malformed — fall back to neutral rather than blocking the whole cycle.
+        logger.warning(f"    [NEWS] Unexpected sentiment payload; treating as NEUTRAL. Raw: {str(news_context)[:120]}")
+        news_context = "NEWS SENTIMENT ANALYSIS: Unavailable — treat all symbols as NEUTRAL sentiment."
 
     symbol_list = ", ".join(f'"{s}"' for s in symbols)
 
