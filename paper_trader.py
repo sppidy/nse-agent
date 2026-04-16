@@ -177,13 +177,14 @@ class Portfolio:
         write_json_atomic(filepath, data)
 
     @classmethod
-    def load(cls, filepath: str = "portfolio.json") -> "Portfolio":
+    def load(cls, filepath: str = "portfolio.json", initial_capital: float | None = None) -> "Portfolio":
         filepath = cls._resolve_path(filepath)
         data = read_json(filepath, default=None)
+        seed = initial_capital if initial_capital is not None else config.INITIAL_CAPITAL
         if not isinstance(data, dict):
-            return cls()
+            return cls(cash=D(seed))
         portfolio = cls(
-            cash=D(data.get("cash", config.INITIAL_CAPITAL)),
+            cash=D(data.get("cash", seed)),
             total_realized_pnl=D(data.get("total_realized_pnl", 0)),
         )
         for sym, pos_data in data.get("positions", {}).items():
@@ -203,10 +204,26 @@ class Portfolio:
         return portfolio
 
 class PaperTrader:
-    def __init__(self, portfolio: Portfolio | None = None, filepath: str = "portfolio.json"):
+    def __init__(
+        self,
+        portfolio: Portfolio | None = None,
+        filepath: str | None = None,
+        name: str = "main",
+    ):
+        """Create a trader for a named portfolio.
+
+        `name` selects an entry from config.PORTFOLIOS; each named portfolio
+        gets its own persistence key (portfolio_{name}.json) and initial
+        capital, so multiple portfolios can run in parallel against the same
+        signals for evaluation.
+        """
+        self.name = name
+        self.initial_capital = config.PORTFOLIOS.get(name, config.INITIAL_CAPITAL)
+        if filepath is None:
+            filepath = f"portfolio_{name}.json" if name != "main" else "portfolio.json"
         self.filepath = Portfolio._resolve_path(filepath)
         self._disk_sync_enabled = portfolio is None
-        self.portfolio = portfolio or Portfolio.load(self.filepath)
+        self.portfolio = portfolio or Portfolio.load(self.filepath, initial_capital=self.initial_capital)
         self._order_counter = len(self.portfolio.orders)
 
     @staticmethod
@@ -216,12 +233,12 @@ class PaperTrader:
     def refresh_portfolio(self) -> None:
         if not self._disk_sync_enabled:
             return
-        latest = Portfolio.load(self.filepath)
+        latest = Portfolio.load(self.filepath, initial_capital=self.initial_capital)
         self.portfolio = latest
         self._order_counter = max(self._order_counter, len(self.portfolio.orders))
 
     def _capital_utilization_floor_pct(self, max_position_size_pct: Decimal) -> Decimal:
-        initial_capital = max(D(config.INITIAL_CAPITAL), Decimal('1'))
+        initial_capital = max(D(self.initial_capital), Decimal('1'))
         cash_ratio = self.portfolio.cash / initial_capital
         deploy_gap = max(Decimal('0'), cash_ratio - (Decimal('1') - D(config.CAPITAL_DEPLOYMENT_TARGET_PCT)))
         slot_budget = deploy_gap / max(Decimal(str(config.MAX_OPEN_POSITIONS)), Decimal('1'))
@@ -500,11 +517,12 @@ class PaperTrader:
         self.refresh_portfolio()
         total = self.portfolio.total_value(prices)
         return {
+            "portfolio": self.name,
             "cash": round(float(self.portfolio.cash), 2),
             "positions_value": round(float(total - self.portfolio.cash), 2),
             "total_value": round(float(total), 2),
-            "initial_capital": config.INITIAL_CAPITAL,
-            "total_return_pct": round(float(((total - D(config.INITIAL_CAPITAL)) / D(config.INITIAL_CAPITAL)) * Decimal('100')), 2),
+            "initial_capital": self.initial_capital,
+            "total_return_pct": round(float(((total - D(self.initial_capital)) / D(self.initial_capital)) * Decimal('100')), 2),
             "realized_pnl": round(float(self.portfolio.total_realized_pnl), 2),
             "open_positions": len(self.portfolio.positions),
             "total_trades": len(self.portfolio.trade_log),
