@@ -15,8 +15,20 @@ import config
 from persistence import read_json, write_json_atomic
 from strategy import add_indicators
 
+# Legacy single-portfolio paths (kept for backward-compat reads).
 JOURNAL_FILE = os.path.join(config.PROJECT_DIR, "trade_journal.json")
 LESSONS_FILE = os.path.join(config.PROJECT_DIR, "lessons_learned.json")
+
+
+def _journal_path(portfolio: str = "main") -> str:
+    # "main" keeps the legacy filename so existing journals aren't orphaned.
+    fname = "trade_journal.json" if portfolio == "main" else f"trade_journal_{portfolio}.json"
+    return os.path.join(config.PROJECT_DIR, fname)
+
+
+def _lessons_path(portfolio: str = "main") -> str:
+    fname = "lessons_learned.json" if portfolio == "main" else f"lessons_learned_{portfolio}.json"
+    return os.path.join(config.PROJECT_DIR, fname)
 
 
 def _load_json(filepath: str) -> list:
@@ -37,12 +49,15 @@ def log_trade(
     ai_signal: dict | None = None,
     indicators: dict | None = None,
     market_context: dict | None = None,
+    portfolio: str = "main",
 ):
     """Log a trade with full context for later analysis."""
-    journal = _load_json(JOURNAL_FILE)
+    path = _journal_path(portfolio)
+    journal = _load_json(path)
     entry = {
         "id": len(journal) + 1,
         "timestamp": datetime.now().isoformat(),
+        "portfolio": portfolio,
         "symbol": symbol,
         "action": action,
         "price": price,
@@ -53,7 +68,7 @@ def log_trade(
         "outcome": None,  # filled when position is closed
     }
     journal.append(entry)
-    _save_json(JOURNAL_FILE, journal)
+    _save_json(path, journal)
     return entry
 
 
@@ -63,6 +78,7 @@ def record_outcome(
     pnl: float,
     pnl_pct: float,
     entry_time: str | None = None,
+    portfolio: str = "main",
 ):
     """Record the outcome of a closed trade.
 
@@ -70,7 +86,8 @@ def record_outcome(
     OLDEST unmatched BUY (FIFO) — this is the correct accounting when a
     symbol has been averaged-up before being closed.
     """
-    journal = _load_json(JOURNAL_FILE)
+    path = _journal_path(portfolio)
+    journal = _load_json(path)
 
     target = None
     if entry_time:
@@ -97,7 +114,7 @@ def record_outcome(
             "result": "WIN" if pnl > 0 else "LOSS",
         }
 
-    _save_json(JOURNAL_FILE, journal)
+    _save_json(path, journal)
 
 
 def get_snapshot(symbol: str, df: pd.DataFrame) -> dict:
@@ -121,9 +138,9 @@ def get_snapshot(symbol: str, df: pd.DataFrame) -> dict:
 
 # ── Performance Analytics ──────────────────────────────────────
 
-def get_performance_stats() -> dict:
+def get_performance_stats(portfolio: str = "main") -> dict:
     """Calculate performance stats from trade journal."""
-    journal = _load_json(JOURNAL_FILE)
+    journal = _load_json(_journal_path(portfolio))
     completed = [e for e in journal if e.get("outcome")]
 
     if not completed:
@@ -172,9 +189,9 @@ def get_performance_stats() -> dict:
 
 # ── AI Learning ────────────────────────────────────────────────
 
-def generate_lessons() -> list[dict]:
+def generate_lessons(portfolio: str = "main") -> list[dict]:
     """Analyze trade journal and extract lessons learned."""
-    journal = _load_json(JOURNAL_FILE)
+    journal = _load_json(_journal_path(portfolio))
     completed = [e for e in journal if e.get("outcome")]
 
     if len(completed) < 3:
@@ -183,7 +200,7 @@ def generate_lessons() -> list[dict]:
     lessons = []
 
     # Lesson 1: Which stocks are profitable vs losing
-    stats = get_performance_stats()
+    stats = get_performance_stats(portfolio)
     for sym, data in stats.get("symbol_stats", {}).items():
         if data["total_pnl"] < 0 and data["losses"] >= 2:
             lessons.append({
@@ -233,18 +250,19 @@ def generate_lessons() -> list[dict]:
             "action": "Consider tighter stop-loss or waiting for stronger confirmation before entry",
         })
 
-    _save_json(LESSONS_FILE, lessons)
+    _save_json(_lessons_path(portfolio), lessons)
     return lessons
 
 
-def get_learning_context() -> str:
+def get_learning_context(portfolio: str = "main") -> str:
     """
     Build a context string from past trades and lessons to feed to Gemini.
     This is the key function — it gives the AI "memory" of what worked.
     """
-    stats = get_performance_stats()
-    lessons = _load_json(LESSONS_FILE) if os.path.exists(LESSONS_FILE) else generate_lessons()
-    journal = _load_json(JOURNAL_FILE)
+    stats = get_performance_stats(portfolio)
+    lessons_path = _lessons_path(portfolio)
+    lessons = _load_json(lessons_path) if os.path.exists(lessons_path) else generate_lessons(portfolio)
+    journal = _load_json(_journal_path(portfolio))
     completed = [e for e in journal if e.get("outcome")]
 
     if not completed:
@@ -293,16 +311,16 @@ def get_learning_context() -> str:
     return context
 
 
-def print_performance_report():
+def print_performance_report(portfolio: str = "main"):
     """Print a formatted performance report."""
-    stats = get_performance_stats()
+    stats = get_performance_stats(portfolio)
 
     if stats.get("total_trades", 0) == 0:
-        print("\n  No completed trades yet. Keep running the bot to build history.")
+        print(f"\n  [{portfolio}] No completed trades yet. Keep running the bot to build history.")
         return
 
     print(f"\n{'='*60}")
-    print(f"  PERFORMANCE REPORT (Learning Engine)")
+    print(f"  PERFORMANCE REPORT — portfolio={portfolio}")
     print(f"{'='*60}")
     print(f"  Total Trades:    {stats['total_trades']}")
     print(f"  Win Rate:        {stats['win_rate']}%")
@@ -319,7 +337,7 @@ def print_performance_report():
     for sym, data in stats.get("symbol_stats", {}).items():
         print(f"    {sym:20s} {data['wins']}W/{data['losses']}L  Rs.{data['total_pnl']:+.2f}")
 
-    lessons = generate_lessons()
+    lessons = generate_lessons(portfolio)
     if lessons and not (len(lessons) == 1 and "Need at least" in lessons[0].get("lesson", "")):
         print(f"\n  Lessons Learned:")
         for l in lessons:

@@ -230,13 +230,19 @@ def scan_trending_stocks(held_symbols: set[str] | None = None, cycle_num: int = 
 
 
 def run_trading_cycle(
-    trader: PaperTrader,
+    trader: PaperTrader | list[PaperTrader],
     cycle_num: int,
     use_ai: bool = True,
     allow_new_entries: bool = True,
     symbol_cooldown: dict[str, datetime] | None = None,
 ) -> None:
-    """Run a single trading cycle."""
+    """Run a single trading cycle against one or more portfolios.
+
+    When `trader` is a list, the same AI/ML signals are applied to every
+    portfolio in order — this is how the `eval` portfolio rides alongside
+    `main` without paying extra LLM cost per cycle.
+    """
+    traders: list[PaperTrader] = trader if isinstance(trader, list) else [trader]
     if symbol_cooldown is None:
         symbol_cooldown = {}
     ist = now_ist()
@@ -254,11 +260,12 @@ def run_trading_cycle(
         )
         return
 
-    # Check stop-loss / take-profit first
-    trader.refresh_portfolio()
-    triggered = trader.check_stop_loss_take_profit(prices)
-    if triggered:
-        logger.info(f"  Triggered {len(triggered)} stop-loss/take-profit orders")
+    # Check stop-loss / take-profit first (per portfolio)
+    for _tr in traders:
+        _tr.refresh_portfolio()
+        triggered = _tr.check_stop_loss_take_profit(prices)
+        if triggered:
+            logger.info(f"  [{_tr.name}] Triggered {len(triggered)} stop-loss/take-profit orders")
 
     if use_ai:
         # Step 1: AI signals (includes news + trade history learning)
@@ -323,136 +330,148 @@ def run_trading_cycle(
         else:
             logger.info(f"  [REGIME] NEUTRAL Market detected. Threshold: {confidence_threshold}")
 
-        # Step 3: Combine AI + ML and execute trades
+        # Step 3: Combine AI + ML and execute trades — fan out to every portfolio
         logger.info("  [3/4] Executing trades...")
         from datetime import datetime, timezone
         SIGNAL_MAX_AGE_SEC = 120
+        # Pre-compute stale-signal filter + indicator snapshots once per symbol
+        fresh_signals: list[dict] = []
         for sig in signals:
-            trader.refresh_portfolio()
-            symbol = sig["symbol"]
-            signal = sig.get("signal", "HOLD")
-            confidence = sig.get("confidence", 0)
-
             generated_at = sig.get("generated_at")
             if generated_at:
                 try:
                     age = (datetime.now(timezone.utc) - datetime.fromisoformat(generated_at)).total_seconds()
                     if age > SIGNAL_MAX_AGE_SEC:
-                        logger.warning(f"  [STALE] {symbol}: signal is {age:.0f}s old (>{SIGNAL_MAX_AGE_SEC}s); skipping")
+                        logger.warning(f"  [STALE] {sig.get('symbol')}: signal is {age:.0f}s old (>{SIGNAL_MAX_AGE_SEC}s); skipping")
                         continue
                 except (TypeError, ValueError):
                     pass
+            fresh_signals.append(sig)
 
-            # Cross-validate with ML model — only if mature
-            ml = ml_predictions.get(symbol, {})
-            confidence, ml_agrees = _adjust_confidence(confidence, signal, ml, ml_mature, regime)
+        for active_trader in traders:
+            logger.info(f"  └─ portfolio={active_trader.name} (capital=Rs.{active_trader.initial_capital:,.0f})")
+            for sig in fresh_signals:
+                active_trader.refresh_portfolio()
+                symbol = sig["symbol"]
+                signal = sig.get("signal", "HOLD")
+                confidence = sig.get("confidence", 0)
 
-            if confidence < confidence_threshold:
-                continue
+                # Cross-validate with ML model — only if mature
+                ml = ml_predictions.get(symbol, {})
+                confidence_adj, ml_agrees = _adjust_confidence(confidence, signal, ml, ml_mature, regime)
 
-            # Get indicator snapshot for learning
-            df = get_historical_data(symbol, period="30d", interval="1d")
-            indicators = get_snapshot(symbol, df) if not df.empty else {}
-            ml_tag = f"ML:{ml.get('prediction','?')}" if not ml_mature else ("ML agrees" if ml_agrees else "ML disagrees")
-
-            if signal == "BUY" and symbol not in trader.portfolio.positions:
-                if not allow_new_entries:
+                if confidence_adj < confidence_threshold:
                     continue
-                price = prices.get(symbol, sig.get("price", 0))
-                if price > 0:
-                    cooldown_ts = symbol_cooldown.get(symbol)
-                    if cooldown_ts and (now_ist() - cooldown_ts).total_seconds() < SYMBOL_COOLDOWN_MIN * 60:
-                        logger.info(f"  [RISK] Cooldown active for {symbol}; skipping re-entry")
-                        continue
 
-                    # Pre-entry validation: volume + divergence + resistance check
-                    if not df.empty and len(df) >= 10:
-                        _latest = df.iloc[-1]
-                        _vol_sma = _latest.get("volume_sma")
-                        if pd.notna(_vol_sma) and _vol_sma > 0:
-                            _vol_ratio = _latest["Volume"] / _vol_sma
-                            if _vol_ratio < 0.8:
-                                logger.info(f"  [FILTER] {symbol} BUY blocked: low volume ({_vol_ratio:.1f}x avg)")
-                                continue
-                        # RSI divergence guard
-                        _rsi_now = _latest.get("rsi")
-                        _rsi_5d = df["rsi"].iloc[-5] if len(df) >= 5 and pd.notna(df["rsi"].iloc[-5]) else None
-                        _price_5d = float(df["Close"].iloc[-5]) if len(df) >= 5 else 0
-                        if pd.notna(_rsi_now) and _rsi_5d and _price_5d > 0:
-                            if price > _price_5d and _rsi_now < _rsi_5d - 3:
-                                logger.info(f"  [FILTER] {symbol} BUY blocked: bearish RSI divergence (price up, RSI {_rsi_now:.0f} < {_rsi_5d:.0f})")
-                                continue
-                        # Near-resistance guard
-                        _high_20d = float(df["High"].tail(20).max())
-                        if _high_20d > 0 and ((_high_20d - price) / price) < 0.015:
-                            logger.info(f"  [FILTER] {symbol} BUY blocked: within 1.5% of 20D resistance ({_high_20d:.2f})")
+                # Get indicator snapshot for learning
+                df = get_historical_data(symbol, period="30d", interval="1d")
+                indicators = get_snapshot(symbol, df) if not df.empty else {}
+                ml_tag = f"ML:{ml.get('prediction','?')}" if not ml_mature else ("ML agrees" if ml_agrees else "ML disagrees")
+
+                if signal == "BUY" and symbol not in active_trader.portfolio.positions:
+                    if not allow_new_entries:
+                        continue
+                    price = prices.get(symbol, sig.get("price", 0))
+                    if price > 0:
+                        cooldown_ts = symbol_cooldown.get((active_trader.name, symbol))
+                        if cooldown_ts and (now_ist() - cooldown_ts).total_seconds() < SYMBOL_COOLDOWN_MIN * 60:
+                            logger.info(f"  [RISK] [{active_trader.name}] Cooldown active for {symbol}; skipping re-entry")
                             continue
 
-                    ai_size_pct = float(sig.get("position_size_pct", 0.05))
-                    ai_size_pct = _sized_position_pct(max(0.01, min(ai_size_pct, 0.10)), confidence, regime)
-                    logger.info(f"  [AI] {sig.get('reason', '')} ({ml_tag})")
-                    order = trader.buy(
-                        symbol,
-                        price,
-                        confidence=confidence,
-                        max_position_size_pct=ai_size_pct,
-                        ai_signal=sig,
-                    )
-                    if order:
-                        log_trade(symbol, "BUY", price, order.quantity,
-                                  ai_signal=sig, indicators=indicators,
-                                  market_context={"ml_prediction": ml})
+                        # Pre-entry validation: volume + divergence + resistance check
+                        if not df.empty and len(df) >= 10:
+                            _latest = df.iloc[-1]
+                            _vol_sma = _latest.get("volume_sma")
+                            if pd.notna(_vol_sma) and _vol_sma > 0:
+                                _vol_ratio = _latest["Volume"] / _vol_sma
+                                if _vol_ratio < 0.8:
+                                    logger.info(f"  [FILTER] {symbol} BUY blocked: low volume ({_vol_ratio:.1f}x avg)")
+                                    continue
+                            # RSI divergence guard
+                            _rsi_now = _latest.get("rsi")
+                            _rsi_5d = df["rsi"].iloc[-5] if len(df) >= 5 and pd.notna(df["rsi"].iloc[-5]) else None
+                            _price_5d = float(df["Close"].iloc[-5]) if len(df) >= 5 else 0
+                            if pd.notna(_rsi_now) and _rsi_5d and _price_5d > 0:
+                                if price > _price_5d and _rsi_now < _rsi_5d - 3:
+                                    logger.info(f"  [FILTER] {symbol} BUY blocked: bearish RSI divergence (price up, RSI {_rsi_now:.0f} < {_rsi_5d:.0f})")
+                                    continue
+                            # Near-resistance guard
+                            _high_20d = float(df["High"].tail(20).max())
+                            if _high_20d > 0 and ((_high_20d - price) / price) < 0.015:
+                                logger.info(f"  [FILTER] {symbol} BUY blocked: within 1.5% of 20D resistance ({_high_20d:.2f})")
+                                continue
 
-            elif signal == "SELL" and symbol in trader.portfolio.positions:
-                price = prices.get(symbol, sig.get("price", 0))
-                pos = trader.portfolio.positions.get(symbol)
-                if price > 0 and pos:
-                    price_d = D(price)
-                    pnl = pos.pnl(price_d)
-                    pnl_pct = pos.pnl_pct(price_d)
-                    entry_time = getattr(pos, "entry_time", None)
-                    logger.info(f"  [AI] {sig.get('reason', '')} ({ml_tag})")
-                    order = trader.sell(symbol, price)
-                    if order:
-                        symbol_cooldown[symbol] = now_ist()
-                        log_trade(symbol, "SELL", price, order.quantity,
-                                  ai_signal=sig, indicators=indicators,
-                                  market_context={"ml_prediction": ml})
-                        record_outcome(symbol, price, pnl, pnl_pct, entry_time=entry_time)
+                        ai_size_pct = float(sig.get("position_size_pct", 0.05))
+                        ai_size_pct = _sized_position_pct(max(0.01, min(ai_size_pct, 0.10)), confidence_adj, regime)
+                        logger.info(f"  [AI][{active_trader.name}] {sig.get('reason', '')} ({ml_tag})")
+                        order = active_trader.buy(
+                            symbol,
+                            price,
+                            confidence=confidence_adj,
+                            max_position_size_pct=ai_size_pct,
+                            ai_signal=sig,
+                        )
+                        if order:
+                            log_trade(symbol, "BUY", price, order.quantity,
+                                      ai_signal=sig, indicators=indicators,
+                                      market_context={"ml_prediction": ml},
+                                      portfolio=active_trader.name)
 
-        # Step 4: Update lessons learned
+                elif signal == "SELL" and symbol in active_trader.portfolio.positions:
+                    price = prices.get(symbol, sig.get("price", 0))
+                    pos = active_trader.portfolio.positions.get(symbol)
+                    if price > 0 and pos:
+                        price_d = D(price)
+                        pnl = pos.pnl(price_d)
+                        pnl_pct = pos.pnl_pct(price_d)
+                        entry_time = getattr(pos, "entry_time", None)
+                        logger.info(f"  [AI][{active_trader.name}] {sig.get('reason', '')} ({ml_tag})")
+                        order = active_trader.sell(symbol, price)
+                        if order:
+                            symbol_cooldown[(active_trader.name, symbol)] = now_ist()
+                            log_trade(symbol, "SELL", price, order.quantity,
+                                      ai_signal=sig, indicators=indicators,
+                                      market_context={"ml_prediction": ml},
+                                      portfolio=active_trader.name)
+                            record_outcome(symbol, price, pnl, pnl_pct,
+                                           entry_time=entry_time,
+                                           portfolio=active_trader.name)
+
+        # Step 4: Update lessons learned (per portfolio)
         logger.info("  [4/4] Updating lessons...")
-        generate_lessons()
+        for _tr in traders:
+            generate_lessons(_tr.name)
     else:
-        # Rule-based signals (no API calls)
+        # Rule-based signals (no API calls) — fan out to each portfolio
         for symbol in config.WATCHLIST:
-            trader.refresh_portfolio()
             df = get_historical_data(symbol, period="30d", interval="1d")
             if df.empty:
                 continue
             sig = get_latest_signal(symbol, df)
+            for active_trader in traders:
+                active_trader.refresh_portfolio()
+                if sig["signal"] == "BUY" and symbol not in active_trader.portfolio.positions:
+                    price = prices.get(symbol, sig["price"])
+                    active_trader.buy(symbol, price)
+                elif sig["signal"] == "SELL" and symbol in active_trader.portfolio.positions:
+                    price = prices.get(symbol, sig["price"])
+                    active_trader.sell(symbol, price)
 
-            if sig["signal"] == "BUY" and symbol not in trader.portfolio.positions:
-                price = prices.get(symbol, sig["price"])
-                trader.buy(symbol, price)
-            elif sig["signal"] == "SELL" and symbol in trader.portfolio.positions:
-                price = prices.get(symbol, sig["price"])
-                trader.sell(symbol, price)
+    # Show status per portfolio
+    for active_trader in traders:
+        summary = active_trader.get_summary(prices)
+        logger.info(f"\n  [{active_trader.name}] Cash: Rs.{summary['cash']:.2f} | "
+              f"Positions: Rs.{summary['positions_value']:.2f} | "
+              f"Total: Rs.{summary['total_value']:.2f} | "
+              f"Return: {summary['total_return_pct']:+.2f}%")
 
-    # Show status
-    summary = trader.get_summary(prices)
-    logger.info(f"\n  Cash: Rs.{summary['cash']:.2f} | "
-          f"Positions: Rs.{summary['positions_value']:.2f} | "
-          f"Total: Rs.{summary['total_value']:.2f} | "
-          f"Return: {summary['total_return_pct']:+.2f}%")
-
-    if trader.portfolio.positions:
-        for sym, pos in trader.portfolio.positions.items():
-            current = D(prices.get(sym, pos.avg_price))
-            pnl = pos.pnl(current)
-            pnl_pct = pos.pnl_pct(current)
-            pnl_str = f"+Rs.{pnl:.2f}" if pnl >= 0 else f"-Rs.{abs(pnl):.2f}"
-            logger.info(f"    {sym:20s} {pos.quantity}x @ Rs.{pos.avg_price:.2f} -> Rs.{current:.2f}  {pnl_str} ({pnl_pct:+.1f}%)")
+        if active_trader.portfolio.positions:
+            for sym, pos in active_trader.portfolio.positions.items():
+                current = D(prices.get(sym, pos.avg_price))
+                pnl = pos.pnl(current)
+                pnl_pct = pos.pnl_pct(current)
+                pnl_str = f"+Rs.{pnl:.2f}" if pnl >= 0 else f"-Rs.{abs(pnl):.2f}"
+                logger.info(f"    [{active_trader.name}] {sym:20s} {pos.quantity}x @ Rs.{pos.avg_price:.2f} -> Rs.{current:.2f}  {pnl_str} ({pnl_pct:+.1f}%)")
 
 
 def run_autopilot(interval_min: int = 15, use_ai: bool = True, force: bool = False):
@@ -480,7 +499,10 @@ def run_autopilot(interval_min: int = 15, use_ai: bool = True, force: bool = Fal
 {'='*60}
 """)
 
-    trader = PaperTrader()
+    # One trader per configured portfolio — same signals, different capital.
+    traders = [PaperTrader(name=name) for name in config.PORTFOLIOS.keys()]
+    trader = traders[0]  # keep `trader` alias for legacy references below
+    logger.info(f"  Portfolios: {', '.join(f'{t.name}=Rs.{t.initial_capital:,.0f}' for t in traders)}")
     cycle = 0
     cycle_file = os.path.join(config.PROJECT_DIR, "logs", "cycle_count.txt")
     last_train_date = None
@@ -568,16 +590,17 @@ def run_autopilot(interval_min: int = 15, use_ai: bool = True, force: bool = Fal
                             "Blocking new BUY entries for today."
                         )
             run_trading_cycle(
-                trader,
+                traders,
                 cycle,
                 use_ai=use_ai,
                 allow_new_entries=allow_new_entries,
                 symbol_cooldown=symbol_cooldown,
             )
 
-            # Show daily performance report every 10 cycles
+            # Show daily performance report every 10 cycles (per portfolio)
             if cycle % 10 == 0:
-                print_performance_report()
+                for _tr in traders:
+                    print_performance_report(_tr.name)
 
             # Sleep until next cycle
             ist = now_ist()
@@ -586,15 +609,17 @@ def run_autopilot(interval_min: int = 15, use_ai: bool = True, force: bool = Fal
 
         except KeyboardInterrupt:
             logger.info("\n\n  Autopilot stopped by user.")
-            # Final summary with full report
+            # Final summary with full report (per portfolio)
             prices = get_watchlist_prices()
             if prices:
-                summary = trader.get_summary(prices)
-                logger.info(f"\n  FINAL STATUS:")
-                logger.info(f"  Total Value: Rs.{summary['total_value']:.2f}")
-                logger.info(f"  Return: {summary['total_return_pct']:+.2f}%")
-                logger.info(f"  Trades: {summary['total_trades']}")
-            print_performance_report()
+                for _tr in traders:
+                    summary = _tr.get_summary(prices)
+                    logger.info(f"\n  FINAL STATUS [{_tr.name}]:")
+                    logger.info(f"  Total Value: Rs.{summary['total_value']:.2f}")
+                    logger.info(f"  Return: {summary['total_return_pct']:+.2f}%")
+                    logger.info(f"  Trades: {summary.get('total_trades', '?')}")
+            for _tr in traders:
+                print_performance_report(_tr.name)
             break
         except Exception as e:
             logger.error(f"  Unhandled autopilot error: {e}")

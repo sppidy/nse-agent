@@ -7,8 +7,17 @@ import time
 # Project root directory (so files are found regardless of cwd)
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Starting capital in INR
-INITIAL_CAPITAL = 10_000_000.0  # Rs. 1 crore for paper trading data harvesting
+# Parallel paper portfolios — same signals, different starting capital.
+# 'main' = large capital for ML/learner data harvesting; 'eval' = realistic small
+# capital so you can evaluate how the system behaves with tight position sizing.
+PORTFOLIOS: dict[str, float] = {
+    "main": 10_000_000.0,  # Rs. 1 crore — data harvesting
+    "eval": 10_000.0,      # Rs. 10,000 — realistic evaluation
+}
+DEFAULT_PORTFOLIO = "main"
+
+# Backward-compat scalar — many modules still reference INITIAL_CAPITAL directly.
+INITIAL_CAPITAL = PORTFOLIOS[DEFAULT_PORTFOLIO]
 MARKET_INDEX = "^NSEI"  # NIFTY 50 index for market regime detection
 
 # Default stocks to track (NSE tickers for yfinance use .NS suffix)
