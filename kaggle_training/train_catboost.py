@@ -4,6 +4,9 @@ Trains on Nifty 250 stocks, 5 years daily data, 45+ features.
 Outputs: predictor_catboost.pkl, predictor_catboost.cbm, feature_cols.json, predictor_catboost.pkl.sha256
 """
 
+import subprocess
+subprocess.check_call(['pip', 'install', '-q', 'ta', 'yfinance', 'catboost'])
+
 import os
 import time
 import json
