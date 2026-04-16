@@ -246,8 +246,12 @@ def run_trading_cycle(
 
     # Get current prices
     prices = get_watchlist_prices()
-    if not prices:
-        logger.warning("  Could not fetch prices. Skipping cycle.")
+    min_coverage = max(1, int(len(config.WATCHLIST) * 0.5))
+    if not prices or len(prices) < min_coverage:
+        logger.warning(
+            f"  Insufficient price coverage ({len(prices)}/{len(config.WATCHLIST)} stocks). "
+            f"Skipping cycle to avoid trading on stale/missing data."
+        )
         return
 
     # Check stop-loss / take-profit first
@@ -321,11 +325,23 @@ def run_trading_cycle(
 
         # Step 3: Combine AI + ML and execute trades
         logger.info("  [3/4] Executing trades...")
+        from datetime import datetime, timezone
+        SIGNAL_MAX_AGE_SEC = 120
         for sig in signals:
             trader.refresh_portfolio()
             symbol = sig["symbol"]
             signal = sig.get("signal", "HOLD")
             confidence = sig.get("confidence", 0)
+
+            generated_at = sig.get("generated_at")
+            if generated_at:
+                try:
+                    age = (datetime.now(timezone.utc) - datetime.fromisoformat(generated_at)).total_seconds()
+                    if age > SIGNAL_MAX_AGE_SEC:
+                        logger.warning(f"  [STALE] {symbol}: signal is {age:.0f}s old (>{SIGNAL_MAX_AGE_SEC}s); skipping")
+                        continue
+                except (TypeError, ValueError):
+                    pass
 
             # Cross-validate with ML model — only if mature
             ml = ml_predictions.get(symbol, {})
@@ -394,6 +410,7 @@ def run_trading_cycle(
                     price_d = D(price)
                     pnl = pos.pnl(price_d)
                     pnl_pct = pos.pnl_pct(price_d)
+                    entry_time = getattr(pos, "entry_time", None)
                     logger.info(f"  [AI] {sig.get('reason', '')} ({ml_tag})")
                     order = trader.sell(symbol, price)
                     if order:
@@ -401,7 +418,7 @@ def run_trading_cycle(
                         log_trade(symbol, "SELL", price, order.quantity,
                                   ai_signal=sig, indicators=indicators,
                                   market_context={"ml_prediction": ml})
-                        record_outcome(symbol, price, pnl, pnl_pct)
+                        record_outcome(symbol, price, pnl, pnl_pct, entry_time=entry_time)
 
         # Step 4: Update lessons learned
         logger.info("  [4/4] Updating lessons...")

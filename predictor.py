@@ -410,11 +410,15 @@ def train_model(symbols: list[str] | None = None, period: str = "5y") -> dict:
         old_f1 = f1_score(y_test, old_pred, zero_division=0)
         if f1 < old_f1 - 0.02:  # Allow 2% margin
             logger.warning(f"  Finetuned model worse (F1: {f1:.3f} vs old {old_f1:.3f}). Keeping old model.")
+            old_acc = accuracy_score(y_test, old_pred)
             return {
                 "samples": len(combined), "symbols": len(all_data),
                 "model_type": model_type, "action": "kept_old",
                 "old_f1": round(old_f1 * 100, 1),
                 "new_f1": round(f1 * 100, 1),
+                "cv_accuracy": round(old_acc * 100, 1),
+                "holdout_f1": round(old_f1 * 100, 1),
+                "model_promoted": False,
                 "reason": "Finetuned model regressed — old model retained",
             }
         logger.info(f"  Finetuned model accepted (F1: {f1:.3f} vs old {old_f1:.3f})")
@@ -441,8 +445,10 @@ def train_model(symbols: list[str] | None = None, period: str = "5y") -> dict:
         "model_type": model_type,
         "action": "finetuned" if is_finetune else "trained_from_scratch",
         "holdout_accuracy": round(accuracy * 100, 1),
+        "cv_accuracy": round(accuracy * 100, 1),  # autopilot reads this key
         "holdout_f1": round(f1 * 100, 1),
         "holdout_precision": round(precision * 100, 1),
+        "model_promoted": True,
         "model_path": model_path,
         "model_sha256": model_hash,
     }
