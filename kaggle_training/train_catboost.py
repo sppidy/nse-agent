@@ -5,7 +5,7 @@ Outputs: predictor_catboost.pkl, predictor_catboost.cbm, feature_cols.json, pred
 """
 
 import subprocess
-subprocess.check_call(['pip', 'install', '-q', 'ta', 'yfinance', 'catboost'])
+subprocess.check_call(['pip', 'install', '-q', 'ta', 'yfinance'])
 
 import os
 import time
