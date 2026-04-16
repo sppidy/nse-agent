@@ -119,8 +119,8 @@ def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
     df["price_vs_bb_mid"] = (df["Close"] - df["bb_mid"]) / df["Close"]
     df["atr_norm"] = df["atr"] / df["Close"]
 
-    # Target: will price go up by more than 0.3% tomorrow? (noise filtering)
-    df["target"] = (df["Close"].shift(-1) > df["Close"] * 1.003).astype(int)
+    # Target: will price go up by more than 1% tomorrow? (filter out noise)
+    df["target"] = (df["Close"].shift(-1) > df["Close"] * 1.01).astype(int)
 
     return df
 
