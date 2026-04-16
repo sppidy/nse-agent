@@ -293,8 +293,10 @@ def predict_watchlist(symbols: list[str] | None = None) -> list[dict]:
 
 def train_model(symbols: list[str] | None = None, period: str = "5y") -> dict:
     """
-    Local training fallback — uses CatBoost if available, else sklearn.
-    For best results, train in Google Colab with GPU (train_catboost_colab.ipynb).
+    Finetune existing CatBoost model with fresh data.
+    Loads the current model and continues training (incremental learning),
+    preserving what it already learned while adapting to new market data.
+    Falls back to training from scratch if no existing model is found.
     """
     os.makedirs(MODEL_DIR, exist_ok=True)
 
@@ -335,24 +337,54 @@ def train_model(symbols: list[str] | None = None, period: str = "5y") -> dict:
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
 
+    # Load existing model for finetuning
+    existing_model = _load_model()
+    is_finetune = existing_model is not None and hasattr(existing_model, 'get_params')
+
     try:
         from catboost import CatBoostClassifier
-        model = CatBoostClassifier(
-            iterations=1000,
-            depth=6,
-            learning_rate=0.05,
-            l2_leaf_reg=3,
-            bootstrap_type='Bernoulli',
-            subsample=0.8,
-            min_data_in_leaf=20,
-            loss_function='Logloss',
-            eval_metric='Logloss',
-            random_seed=42,
-            early_stopping_rounds=100,
-            verbose=100,
-        )
-        logger.info(f"  Training CatBoost on {len(X_train):,} samples...")
-        model.fit(X_train, y_train, eval_set=(X_test, y_test))
+
+        if is_finetune:
+            # Finetune: continue from existing model with lower learning rate
+            logger.info(f"  Finetuning existing CatBoost model on {len(X_train):,} samples...")
+            model = CatBoostClassifier(
+                iterations=300,
+                depth=6,
+                learning_rate=0.01,       # Lower LR for finetuning — gentle updates
+                l2_leaf_reg=5,
+                bootstrap_type='Bernoulli',
+                subsample=0.8,
+                min_data_in_leaf=20,
+                loss_function='Logloss',
+                eval_metric='Logloss',
+                random_seed=42,
+                early_stopping_rounds=50,
+                verbose=100,
+            )
+            model.fit(
+                X_train, y_train,
+                eval_set=(X_test, y_test),
+                init_model=existing_model,  # Continue from existing model
+            )
+        else:
+            # No existing model — train from scratch
+            logger.info(f"  No existing model found. Training CatBoost from scratch on {len(X_train):,} samples...")
+            model = CatBoostClassifier(
+                iterations=1000,
+                depth=6,
+                learning_rate=0.05,
+                l2_leaf_reg=3,
+                bootstrap_type='Bernoulli',
+                subsample=0.8,
+                min_data_in_leaf=20,
+                loss_function='Logloss',
+                eval_metric='Logloss',
+                random_seed=42,
+                early_stopping_rounds=100,
+                verbose=100,
+            )
+            model.fit(X_train, y_train, eval_set=(X_test, y_test))
+
         model_type = "catboost"
     except ImportError:
         from sklearn.ensemble import GradientBoostingClassifier
@@ -363,6 +395,7 @@ def train_model(symbols: list[str] | None = None, period: str = "5y") -> dict:
         )
         model.fit(X_train, y_train)
         model_type = "sklearn"
+        is_finetune = False
 
     # Evaluate
     from sklearn.metrics import accuracy_score, f1_score, precision_score
@@ -370,6 +403,21 @@ def train_model(symbols: list[str] | None = None, period: str = "5y") -> dict:
     accuracy = accuracy_score(y_test, y_pred)
     f1 = f1_score(y_test, y_pred, zero_division=0)
     precision = precision_score(y_test, y_pred, zero_division=0)
+
+    # Only save if finetuned model is not worse than existing
+    if is_finetune:
+        old_pred = existing_model.predict(X_test)
+        old_f1 = f1_score(y_test, old_pred, zero_division=0)
+        if f1 < old_f1 - 0.02:  # Allow 2% margin
+            logger.warning(f"  Finetuned model worse (F1: {f1:.3f} vs old {old_f1:.3f}). Keeping old model.")
+            return {
+                "samples": len(combined), "symbols": len(all_data),
+                "model_type": model_type, "action": "kept_old",
+                "old_f1": round(old_f1 * 100, 1),
+                "new_f1": round(f1 * 100, 1),
+                "reason": "Finetuned model regressed — old model retained",
+            }
+        logger.info(f"  Finetuned model accepted (F1: {f1:.3f} vs old {old_f1:.3f})")
 
     # Save
     model_path = MODEL_PKL if model_type == "catboost" else LEGACY_MODEL
@@ -391,6 +439,7 @@ def train_model(symbols: list[str] | None = None, period: str = "5y") -> dict:
         "samples": len(combined),
         "symbols": len(all_data),
         "model_type": model_type,
+        "action": "finetuned" if is_finetune else "trained_from_scratch",
         "holdout_accuracy": round(accuracy * 100, 1),
         "holdout_f1": round(f1 * 100, 1),
         "holdout_precision": round(precision * 100, 1),
