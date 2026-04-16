@@ -122,30 +122,30 @@ def _adjust_confidence(confidence: float, signal: str, ml: dict, ml_mature: bool
         ml_dir = ml.get("prediction", "")
         ml_conf = float(ml.get("confidence", 0))
         if signal == "BUY" and ml_dir == "DOWN" and ml_conf > 0.6:
-            adjusted *= 0.65
+            adjusted *= 0.50  # Strong penalty: ML disagrees with BUY
             ml_agrees = False
         elif signal == "SELL" and ml_dir == "UP" and ml_conf > 0.6:
-            adjusted *= 0.65
+            adjusted *= 0.50  # Strong penalty: ML disagrees with SELL
             ml_agrees = False
         elif signal == "BUY" and ml_dir == "UP":
-            adjusted = min(adjusted * 1.1, 1.0)
+            adjusted = min(adjusted * 1.05, 1.0)  # Modest boost for agreement
     elif ml and not ml_mature:
         ml_dir = ml.get("prediction", "?")
         ml_agrees = (signal == "BUY" and ml_dir == "UP") or (signal == "SELL" and ml_dir == "DOWN")
 
     if regime == "BEAR" and signal == "BUY":
-        adjusted *= 0.9
+        adjusted *= 0.85
     elif regime == "BULL" and signal == "BUY":
-        adjusted = min(adjusted * 1.05, 1.0)
+        adjusted = min(adjusted * 1.03, 1.0)
 
     return max(0.0, min(adjusted, 1.0)), ml_agrees
 
 
 def _sized_position_pct(ai_size_pct: float, adjusted_conf: float, regime: str) -> float:
-    # Let AI drive sizing, but add confidence/regime caps for capital preservation.
-    conf_cap = 0.25 if adjusted_conf < 0.7 else 0.4 if adjusted_conf < 0.8 else 0.6
-    regime_cap = 0.3 if regime == "BEAR" else 0.8
-    return max(0.01, min(ai_size_pct, conf_cap, regime_cap))
+    # Conservative sizing: AI suggests, but hard caps protect capital.
+    conf_cap = 0.05 if adjusted_conf < 0.75 else 0.08 if adjusted_conf < 0.85 else 0.10
+    regime_cap = 0.05 if regime == "BEAR" else 0.10
+    return max(0.01, min(ai_size_pct, conf_cap, regime_cap, config.MAX_POSITION_SIZE_PCT))
 
 
 def scan_trending_stocks(held_symbols: set[str] | None = None, cycle_num: int = 0) -> list[str]:
@@ -272,7 +272,7 @@ def run_trading_cycle(
                 if df.empty:
                     continue
                 sig = get_scored_signal(symbol, df)
-                if sig["signal"] in ("BUY", "SELL") and sig["confidence"] >= 0.55:
+                if sig["signal"] in ("BUY", "SELL") and sig["confidence"] >= 0.70:
                     # Scale position size conservatively from confidence
                     size_pct = max(0.02, min(sig["confidence"] * 0.08, 0.06))
                     signals.append({
@@ -310,14 +310,14 @@ def run_trading_cycle(
 
         # Market Regime Check
         regime = get_market_regime()
-        confidence_threshold = 0.6
+        confidence_threshold = 0.72
         if regime == "BEAR":
-            logger.warning(f"  [REGIME] BEAR Market detected ({config.MARKET_INDEX} below 200-day SMA). AI sizing enabled, confidence threshold raised.")
-            confidence_threshold = 0.75
+            logger.warning(f"  [REGIME] BEAR Market detected ({config.MARKET_INDEX} below 200-day SMA). Confidence threshold raised to 0.82.")
+            confidence_threshold = 0.82
         elif regime == "BULL":
-            logger.info(f"  [REGIME] BULL Market detected ({config.MARKET_INDEX} above 50-day & 200-day SMA). Normal trading rules apply.")
+            logger.info(f"  [REGIME] BULL Market detected ({config.MARKET_INDEX} above 50-day & 200-day SMA). Threshold: {confidence_threshold}")
         else:
-            logger.info(f"  [REGIME] NEUTRAL Market detected. Normal trading rules apply.")
+            logger.info(f"  [REGIME] NEUTRAL Market detected. Threshold: {confidence_threshold}")
 
         # Step 3: Combine AI + ML and execute trades
         logger.info("  [3/4] Executing trades...")
@@ -348,8 +348,32 @@ def run_trading_cycle(
                     if cooldown_ts and (now_ist() - cooldown_ts).total_seconds() < SYMBOL_COOLDOWN_MIN * 60:
                         logger.info(f"  [RISK] Cooldown active for {symbol}; skipping re-entry")
                         continue
-                    ai_size_pct = float(sig.get("position_size_pct", confidence))
-                    ai_size_pct = _sized_position_pct(max(0.01, min(ai_size_pct, 1.0)), confidence, regime)
+
+                    # Pre-entry validation: volume + divergence + resistance check
+                    if not df.empty and len(df) >= 10:
+                        _latest = df.iloc[-1]
+                        _vol_sma = _latest.get("volume_sma")
+                        if pd.notna(_vol_sma) and _vol_sma > 0:
+                            _vol_ratio = _latest["Volume"] / _vol_sma
+                            if _vol_ratio < 0.8:
+                                logger.info(f"  [FILTER] {symbol} BUY blocked: low volume ({_vol_ratio:.1f}x avg)")
+                                continue
+                        # RSI divergence guard
+                        _rsi_now = _latest.get("rsi")
+                        _rsi_5d = df["rsi"].iloc[-5] if len(df) >= 5 and pd.notna(df["rsi"].iloc[-5]) else None
+                        _price_5d = float(df["Close"].iloc[-5]) if len(df) >= 5 else 0
+                        if pd.notna(_rsi_now) and _rsi_5d and _price_5d > 0:
+                            if price > _price_5d and _rsi_now < _rsi_5d - 3:
+                                logger.info(f"  [FILTER] {symbol} BUY blocked: bearish RSI divergence (price up, RSI {_rsi_now:.0f} < {_rsi_5d:.0f})")
+                                continue
+                        # Near-resistance guard
+                        _high_20d = float(df["High"].tail(20).max())
+                        if _high_20d > 0 and ((_high_20d - price) / price) < 0.015:
+                            logger.info(f"  [FILTER] {symbol} BUY blocked: within 1.5% of 20D resistance ({_high_20d:.2f})")
+                            continue
+
+                    ai_size_pct = float(sig.get("position_size_pct", 0.05))
+                    ai_size_pct = _sized_position_pct(max(0.01, min(ai_size_pct, 0.10)), confidence, regime)
                     logger.info(f"  [AI] {sig.get('reason', '')} ({ml_tag})")
                     order = trader.buy(
                         symbol,

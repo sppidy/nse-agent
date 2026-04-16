@@ -188,12 +188,12 @@ def get_scored_signal(symbol: str, df: pd.DataFrame) -> dict:
 
     # ── Combine scores ──
     max_possible = 9  # 2+2+2+1+1+1
-    # Require 3+ score with clear directional edge (score gap >= 2)
-    if buy_score >= 3 and buy_score >= sell_score + 2:
-        confidence = round(min(buy_score / max_possible + 0.3, 0.85), 2)
+    # Require 4+ score with clear directional edge (score gap >= 2)
+    if buy_score >= 4 and buy_score >= sell_score + 2:
+        confidence = round(min(buy_score / max_possible + 0.2, 0.85), 2)
         signal = "BUY"
-    elif sell_score >= 3 and sell_score >= buy_score + 2:
-        confidence = round(min(sell_score / max_possible + 0.3, 0.85), 2)
+    elif sell_score >= 4 and sell_score >= buy_score + 2:
+        confidence = round(min(sell_score / max_possible + 0.2, 0.85), 2)
         signal = "SELL"
     else:
         confidence = 0

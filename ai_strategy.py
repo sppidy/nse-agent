@@ -96,10 +96,10 @@ def _normalize_signal_record(raw: dict | SignalSchema, symbol: str, fallback_pri
         confidence = 0.0
     confidence = max(0.0, min(confidence, 1.0))
     try:
-        position_size_pct = float(raw.get("position_size_pct", confidence))
+        position_size_pct = float(raw.get("position_size_pct", 0.05))
     except (TypeError, ValueError):
-        position_size_pct = confidence
-    position_size_pct = max(0.01, min(position_size_pct, 1.0))
+        position_size_pct = 0.05
+    position_size_pct = max(0.01, min(position_size_pct, 0.10))  # Hard cap at 10%
 
     def _safe_num(v):
         if v is None:
@@ -541,7 +541,7 @@ def _call_gemini(client, prompt: str, retries: int = _MAX_RETRIES) -> str:
 
 
 def _prepare_stock_summary(symbol: str, df: pd.DataFrame) -> str:
-    """Convert stock data into a text summary for AI."""
+    """Convert stock data into a rich text summary for AI with key indicators."""
     df = add_indicators(df)
     if df.empty or len(df) < 5:
         return f"{symbol}: insufficient data"
@@ -569,16 +569,73 @@ def _prepare_stock_summary(symbol: str, df: pd.DataFrame) -> str:
     current_vol = latest["Volume"]
     vol_ratio = current_vol / avg_vol if avg_vol > 0 else 1
 
+    # MACD data
+    macd_diff = latest.get("macd_diff")
+    prev_macd_diff = prev.get("macd_diff")
+    macd_cross = ""
+    if pd.notna(macd_diff) and pd.notna(prev_macd_diff):
+        if prev_macd_diff <= 0 < macd_diff:
+            macd_cross = "BULLISH CROSS"
+        elif prev_macd_diff >= 0 > macd_diff:
+            macd_cross = "BEARISH CROSS"
+        elif macd_diff > 0:
+            macd_cross = "positive"
+        else:
+            macd_cross = "negative"
+
+    # Bollinger Band position
+    bb_high = latest.get("bb_high")
+    bb_low = latest.get("bb_low")
+    bb_pos = ""
+    if pd.notna(bb_high) and pd.notna(bb_low) and (bb_high - bb_low) > 0:
+        bb_pct = (price - bb_low) / (bb_high - bb_low) * 100
+        bb_pos = f"{bb_pct:.0f}% (near {'upper' if bb_pct > 80 else 'lower' if bb_pct < 20 else 'mid'})"
+
+    # RSI divergence check
+    rsi_div = ""
+    if len(df) >= 10:
+        price_5d_ago = float(df["Close"].iloc[-5])
+        rsi_5d_ago = df["rsi"].iloc[-5] if pd.notna(df["rsi"].iloc[-5]) else None
+        rsi_now = latest["rsi"] if pd.notna(latest.get("rsi")) else None
+        if rsi_5d_ago and rsi_now:
+            if price > price_5d_ago and rsi_now < rsi_5d_ago:
+                rsi_div = "BEARISH DIVERGENCE (price up, RSI down)"
+            elif price < price_5d_ago and rsi_now > rsi_5d_ago:
+                rsi_div = "BULLISH DIVERGENCE (price down, RSI up)"
+
+    # Support/resistance from recent range
+    if len(df) >= 20:
+        high_20d = float(df["High"].tail(20).max())
+        low_20d = float(df["Low"].tail(20).min())
+        dist_to_resist = ((high_20d - price) / price) * 100
+        dist_to_support = ((price - low_20d) / price) * 100
+    else:
+        high_20d = high_5d
+        low_20d = low_5d
+        dist_to_resist = dist_to_support = 0
+
+    # Up/down day count
+    closes_5d = df["Close"].tail(5)
+    up_days = int((closes_5d.diff().dropna() > 0).sum())
+
     summary = (
         f"Symbol: {symbol}\n"
         f"Price: Rs.{price:.2f} ({change_pct:+.2f}%)\n"
-        f"5D Range: Rs.{low_5d:.2f}-{high_5d:.2f}\n"
-        f"20D Trend: {trend_20d:+.2f}%\n"
-        f"RSI(14): {latest['rsi']:.1f}\n"
-        f"EMA9: {latest['ema_short']:.2f}, EMA21: {latest['ema_long']:.2f} "
-        f"({'Bullish' if latest['ema_short'] > latest['ema_long'] else 'Bearish'})\n"
-        f"Volatility: {volatility:.2f}%, Vol: {vol_ratio:.1f}x avg\n"
+        f"5D Range: Rs.{low_5d:.2f}-{high_5d:.2f} | 20D Range: Rs.{low_20d:.2f}-{high_20d:.2f}\n"
+        f"Dist to 20D resistance: {dist_to_resist:.1f}% | Dist to 20D support: {dist_to_support:.1f}%\n"
+        f"20D Trend: {trend_20d:+.2f}% | 5D direction: {up_days}/5 up days\n"
+        f"RSI(14): {latest['rsi']:.1f}"
     )
+    if rsi_div:
+        summary += f" *** {rsi_div} ***"
+    summary += (
+        f"\nEMA9: {latest['ema_short']:.2f}, EMA21: {latest['ema_long']:.2f} "
+        f"({'Bullish' if latest['ema_short'] > latest['ema_long'] else 'Bearish'})\n"
+        f"MACD histogram: {macd_diff:.4f} ({macd_cross})\n"
+    )
+    if bb_pos:
+        summary += f"Bollinger Band position: {bb_pos}\n"
+    summary += f"Volatility: {volatility:.2f}%, Vol: {vol_ratio:.1f}x avg\n"
 
     summary += "Last 5 days: "
     for idx, row in recent.tail(5).iterrows():
@@ -625,7 +682,7 @@ async def analyze_batch_async(stock_data: list[tuple[str, pd.DataFrame]]) -> lis
 
     symbol_list = ", ".join(f'"{s}"' for s in symbols)
 
-    prompt = f"""You are a quantitative trading analyst for NSE Indian stocks. Analyze each stock and return trading signals.
+    prompt = f"""You are a CONSERVATIVE quantitative trading analyst for NSE Indian stocks. Your job is to find HIGH-PROBABILITY setups only. When in doubt, signal HOLD.
 
 {learning}
 
@@ -636,19 +693,26 @@ STOCKS DATA:
 
 PORTFOLIO: Rs.{config.INITIAL_CAPITAL} capital, max {config.MAX_POSITION_SIZE_PCT*100}% per position, {config.STOP_LOSS_PCT*100}% stop loss, {config.TAKE_PROFIT_PCT*100}% take profit.
 
-RULES:
-1. Use trade history to avoid repeating losing patterns and favor winning setups.
-2. NEWS SENTIMENT is critical — bearish news lowers confidence, bullish news boosts it.
-3. BEAR market = cautious BUY signals. Negative company news = SELL or HOLD.
+STRICT RULES — you MUST follow these:
+1. ONLY signal BUY/SELL if AT LEAST 3 of these independently confirm: RSI, EMA trend, MACD, Bollinger Bands, volume, support/resistance, news sentiment.
+2. If RSI DIVERGENCE is present (price up but RSI down, or vice versa), it is a STRONG warning — reduce confidence by 0.15 or flip to HOLD.
+3. Do NOT signal BUY if price is within 1.5% of 20D resistance. Do NOT signal SELL if price is within 1.5% of 20D support.
+4. Volume must be >1.0x average for a BUY signal. Low volume BUY = HOLD.
+5. HOLD is always the safe default. A mediocre BUY is worse than no trade. If unsure, signal HOLD with confidence 0.
+6. Confidence below 0.72 means HOLD — do not waste a signal on low-confidence setups.
+7. NEWS SENTIMENT: bearish news = automatic HOLD or SELL. Never BUY against negative news.
+8. BEAR market = no BUY signals below 0.80 confidence. Be extremely selective.
+9. Position size: use 0.03-0.05 for moderate confidence, 0.06-0.08 for strong setups. NEVER exceed 0.10.
+10. Use trade history to avoid repeating losing patterns and favor winning setups.
 
 OUTPUT: Return a JSON object with a "signals" key containing an array of exactly {len(symbols)} objects, one per stock.
 Example format: {{"signals": [...]}}
 Each object MUST have these fields:
 - "symbol": string (use exact symbol including .NS suffix: {symbol_list})
 - "signal": "BUY" or "SELL" or "HOLD"
-- "confidence": number 0.0 to 1.0
-- "position_size_pct": number 0.01 to 1.0
-- "reason": string (brief explanation under 200 chars)
+- "confidence": number 0.0 to 1.0 (use 0.0 for HOLD, 0.72+ for actionable signals)
+- "position_size_pct": number 0.01 to 0.10 (conservative sizing)
+- "reason": string (MUST list which indicators confirm, e.g. "RSI oversold + MACD bullish cross + volume 2.1x = 3 confirmations")
 - "entry_price": number or null
 - "stop_loss": number or null
 - "target": number or null
