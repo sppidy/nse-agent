@@ -219,6 +219,8 @@ class PaperTrader:
         """
         self.name = name
         self.initial_capital = config.PORTFOLIOS.get(name, config.INITIAL_CAPITAL)
+        self.max_position_size_pct = config.PORTFOLIO_MAX_POSITION_PCT.get(name, config.MAX_POSITION_SIZE_PCT)
+        self.max_open_positions = config.PORTFOLIO_MAX_OPEN_POSITIONS.get(name, config.MAX_OPEN_POSITIONS)
         if filepath is None:
             filepath = f"portfolio_{name}.json" if name != "main" else "portfolio.json"
         self.filepath = Portfolio._resolve_path(filepath)
@@ -241,7 +243,7 @@ class PaperTrader:
         initial_capital = max(D(self.initial_capital), Decimal('1'))
         cash_ratio = self.portfolio.cash / initial_capital
         deploy_gap = max(Decimal('0'), cash_ratio - (Decimal('1') - D(config.CAPITAL_DEPLOYMENT_TARGET_PCT)))
-        slot_budget = deploy_gap / max(Decimal(str(config.MAX_OPEN_POSITIONS)), Decimal('1'))
+        slot_budget = deploy_gap / max(Decimal(str(self.max_open_positions)), Decimal('1'))
         floor_pct = max(D(config.CAPITAL_UTILIZATION_MIN_BET_PCT), slot_budget)
         return self._clamp(floor_pct, Decimal('0'), max_position_size_pct)
 
@@ -296,7 +298,7 @@ class PaperTrader:
         price = D(price)
         confidence = D(confidence)
         if max_position_size_pct is None:
-            max_position_size_pct = D(config.MAX_POSITION_SIZE_PCT)
+            max_position_size_pct = D(self.max_position_size_pct)
         else:
             max_position_size_pct = D(max_position_size_pct)
 
@@ -342,9 +344,9 @@ class PaperTrader:
                 return None
             total_cost = Decimal(str(quantity)) * fill_price + brokerage
 
-        # Check max positions
-        if symbol not in self.portfolio.positions and len(self.portfolio.positions) >= config.MAX_OPEN_POSITIONS:
-            logger.warning(f"Cannot buy {symbol}: max {config.MAX_OPEN_POSITIONS} positions reached")
+        # Check max positions (per-portfolio cap)
+        if symbol not in self.portfolio.positions and len(self.portfolio.positions) >= self.max_open_positions:
+            logger.warning(f"Cannot buy {symbol}: max {self.max_open_positions} positions reached")
             return None
 
         # Execute
