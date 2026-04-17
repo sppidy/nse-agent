@@ -29,6 +29,15 @@ PORTFOLIO_MAX_OPEN_POSITIONS: dict[str, int] = {
     "eval": 4,  # 4 × 25% = 100% — fully deployable
 }
 
+# Per-portfolio confidence thresholds by regime. `eval` runs aggressive on
+# purpose — the whole point is to evaluate whether more permissive entry
+# rules generate alpha vs. the conservative `main` portfolio. Bear-regime
+# threshold is the strictest; bull is loosest.
+PORTFOLIO_CONFIDENCE_THRESHOLD: dict[str, dict[str, float]] = {
+    "main": {"BULL": 0.72, "NEUTRAL": 0.72, "BEAR": 0.82},
+    "eval": {"BULL": 0.55, "NEUTRAL": 0.60, "BEAR": 0.68},
+}
+
 # Backward-compat scalar — many modules still reference INITIAL_CAPITAL directly.
 INITIAL_CAPITAL = PORTFOLIOS[DEFAULT_PORTFOLIO]
 MARKET_INDEX = "^NSEI"  # NIFTY 50 index for market regime detection
