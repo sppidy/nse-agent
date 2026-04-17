@@ -38,6 +38,15 @@ PORTFOLIO_CONFIDENCE_THRESHOLD: dict[str, dict[str, float]] = {
     "eval": {"BULL": 0.55, "NEUTRAL": 0.60, "BEAR": 0.68},
 }
 
+# Force the CatBoost ML model to influence trades regardless of the 75%
+# maturity gate. `eval` opts in so we can observe how the live (still
+# immature) model actually performs — it gets the full ±penalty/boost
+# treatment in confidence adjustment. `main` stays gated for safety.
+PORTFOLIO_ML_OVERRIDE: dict[str, bool] = {
+    "main": False,
+    "eval": True,
+}
+
 # Backward-compat scalar — many modules still reference INITIAL_CAPITAL directly.
 INITIAL_CAPITAL = PORTFOLIOS[DEFAULT_PORTFOLIO]
 MARKET_INDEX = "^NSEI"  # NIFTY 50 index for market regime detection
