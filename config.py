@@ -16,6 +16,19 @@ PORTFOLIOS: dict[str, float] = {
 }
 DEFAULT_PORTFOLIO = "main"
 
+# Per-portfolio position-sizing overrides. A Rs.10k portfolio cannot use the
+# same 10% cap as Rs.1cr — 10% of 10k = Rs.1000 which prices out most stocks
+# (1 share ≈ Rs.500-1000). Widen eval's cap and shrink its max open positions
+# so the basket is concentrated enough to actually deploy capital.
+PORTFOLIO_MAX_POSITION_PCT: dict[str, float] = {
+    "main": 0.10,
+    "eval": 0.25,
+}
+PORTFOLIO_MAX_OPEN_POSITIONS: dict[str, int] = {
+    "main": 20,
+    "eval": 4,  # 4 × 25% = 100% — fully deployable
+}
+
 # Backward-compat scalar — many modules still reference INITIAL_CAPITAL directly.
 INITIAL_CAPITAL = PORTFOLIOS[DEFAULT_PORTFOLIO]
 MARKET_INDEX = "^NSEI"  # NIFTY 50 index for market regime detection
