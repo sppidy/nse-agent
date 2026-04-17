@@ -88,8 +88,13 @@ SCAN_POOL = [
 MAX_WATCHLIST = 20
 MIN_WATCHLIST = 10
 WATCHLIST_STATE_FILE = os.path.join(config.PROJECT_DIR, "watchlist_state.json")
+CYCLE_COUNT_FILE = os.path.join(config.PROJECT_DIR, "logs", "cycle_count.txt")
 MAX_DAILY_DRAWDOWN_PCT = 3.5
 SYMBOL_COOLDOWN_MIN = 45
+# Rotate a symbol out of the watchlist after this many cycles with no
+# actionable BUY/SELL signal from any source (AI or rule-based, raw conf
+# >= 0.50). At a 15-min cadence, 8 cycles ≈ 2 hours of dead air.
+STALE_CYCLE_LIMIT = 8
 
 
 def _trend_score(hist: pd.DataFrame) -> float | None:
@@ -156,14 +161,37 @@ def _sized_position_pct(ai_size_pct: float, adjusted_conf: float, regime: str, h
     return max(0.01, min(ai_size_pct, hard_cap * conf_frac, hard_cap * regime_frac, hard_cap))
 
 
-def scan_trending_stocks(held_symbols: set[str] | None = None, cycle_num: int = 0) -> list[str]:
-    """Scan NSE stocks for trending movers. Returns list of symbols to add."""
+def scan_trending_stocks(
+    held_symbols: set[str] | None = None,
+    cycle_num: int = 0,
+    stale_counts: dict[str, int] | None = None,
+) -> list[str]:
+    """Scan NSE stocks for trending movers. Returns list of symbols added.
+
+    Rotation rules:
+      * stocks with no actionable signal for STALE_CYCLE_LIMIT cycles are
+        eligible for eviction (unless currently held);
+      * when the watchlist is at MAX_WATCHLIST and we have a stronger
+        candidate than the worst stale member, swap them;
+      * single-day price drop > 3% still triggers cold removal as before.
+    """
     if held_symbols is None:
         held_symbols = set()
+    if stale_counts is None:
+        stale_counts = {}
 
     logger.info("  [SCAN] Scanning NSE for trending stocks...")
     state = read_json(WATCHLIST_STATE_FILE, default={})
     held_cycles = state.get("hold_cycles", {})
+
+    # Backfill missing hold_cycles for symbols that joined via config.WATCHLIST
+    # rather than the scanner — without this, the cycles_held>=3 guard never
+    # fires for the original 20 (everything looks freshly added).
+    current = set(config.WATCHLIST)
+    for sym in current:
+        held_cycles.setdefault(sym, 0)
+
+    # Score every SCAN_POOL candidate
     results = []
     for sym in SCAN_POOL:
         try:
@@ -178,7 +206,6 @@ def scan_trending_stocks(held_symbols: set[str] | None = None, cycle_num: int = 
             vol = float(hist["Volume"].iloc[-1])
             avg_vol = float(hist["Volume"].tail(20).mean())
             vol_ratio = vol / avg_vol if avg_vol > 0 else 1
-            # Filter: affordable + trending
             max_price = config.INITIAL_CAPITAL * config.MAX_POSITION_SIZE_PCT
             if price <= max_price and score > 2.0 and vol > 0:
                 results.append({
@@ -187,26 +214,57 @@ def scan_trending_stocks(held_symbols: set[str] | None = None, cycle_num: int = 
                 })
         except Exception:
             logger.warning(f"  [SCAN] Skipping {sym}: data fetch failed")
-
-    # Sort by score (change % + volume bonus)
     results.sort(key=lambda x: x["score"], reverse=True)
 
-    # Update watchlist
-    current = set(config.WATCHLIST)
-    added = []
-    for r in results:
-        if r["sym"] in held_symbols:
-            continue
-        if r["sym"] not in current and len(current) < MAX_WATCHLIST:
-            current.add(r["sym"])
-            added.append(r["sym"])
-            held_cycles[r["sym"]] = cycle_num
-            logger.info(f"  [SCAN] + {r['sym']}: Rs.{r['price']:.2f} ({r['chg']:+.1f}%, vol:{r['vol_ratio']:.1f}x)")
+    # Compute stale list (sorted worst first) — used both for direct removal
+    # and for swap-eviction when the watchlist is full.
+    stale = sorted(
+        (
+            (sym, stale_counts.get(sym, 0))
+            for sym in current
+            if sym not in held_symbols and stale_counts.get(sym, 0) >= STALE_CYCLE_LIMIT
+        ),
+        key=lambda x: -x[1],
+    )
 
-    # Remove stocks that have gone cold (change < -2% and not in positions)
+    # Drop stale symbols outright (down to MIN_WATCHLIST floor)
+    added: list[str] = []
+    for sym, count in stale:
+        if len(current) <= MIN_WATCHLIST:
+            break
+        current.discard(sym)
+        held_cycles.pop(sym, None)
+        stale_counts.pop(sym, None)
+        logger.info(f"  [SCAN] - {sym}: removed (stale {count} cycles)")
+
+    # Add new candidates — first fill empty slots, then swap with remaining
+    # stale members when at cap.
+    stale_remaining = [s for s, _ in stale if s in current]
+    for r in results:
+        sym = r["sym"]
+        if sym in current or sym in held_symbols:
+            continue
+        if len(current) < MAX_WATCHLIST:
+            current.add(sym)
+            added.append(sym)
+            held_cycles[sym] = cycle_num
+            stale_counts[sym] = 0
+            logger.info(f"  [SCAN] + {sym}: Rs.{r['price']:.2f} ({r['chg']:+.1f}%, vol:{r['vol_ratio']:.1f}x, score:{r['score']:.1f})")
+        elif stale_remaining:
+            evict = stale_remaining.pop(0)
+            current.discard(evict)
+            held_cycles.pop(evict, None)
+            stale_counts.pop(evict, None)
+            current.add(sym)
+            added.append(sym)
+            held_cycles[sym] = cycle_num
+            stale_counts[sym] = 0
+            logger.info(f"  [SCAN] swap: -{evict} +{sym} (Rs.{r['price']:.2f}, score:{r['score']:.1f})")
+
+    # Legacy cold removal (sharp 1-day drop) — retained as a safety net.
     cold = []
     for sym in list(current):
-        if sym in SCAN_POOL:
+        if sym in SCAN_POOL and sym not in held_symbols:
             try:
                 t = yf.Ticker(sym)
                 hist = t.history(period="5d")
@@ -214,23 +272,24 @@ def scan_trending_stocks(held_symbols: set[str] | None = None, cycle_num: int = 
                     price = hist["Close"].iloc[-1]
                     prev = hist["Close"].iloc[-2]
                     chg = ((price - prev) / prev) * 100
-                    hold_since = int(held_cycles.get(sym, cycle_num))
+                    hold_since = int(held_cycles.get(sym, 0))
                     cycles_held = max(0, cycle_num - hold_since)
-                    if chg < -3 and sym not in held_symbols and cycles_held >= 3:
+                    if chg < -3 and cycles_held >= 3:
                         cold.append(sym)
             except Exception:
                 logger.warning(f"  [SCAN] Could not re-evaluate {sym} for removal")
-
     for sym in cold:
-        if len(current) > MIN_WATCHLIST:  # Keep at least minimum basket breadth
+        if len(current) > MIN_WATCHLIST:
             current.discard(sym)
             held_cycles.pop(sym, None)
-            logger.info(f"  [SCAN] - {sym}: removed (cold)")
+            stale_counts.pop(sym, None)
+            logger.info(f"  [SCAN] - {sym}: removed (cold, -3%+ daily)")
 
     config.WATCHLIST = list(current)
     write_json_atomic(WATCHLIST_STATE_FILE, {
         "watchlist": config.WATCHLIST,
         "hold_cycles": held_cycles,
+        "stale_counts": stale_counts,
         "updated_at": now_ist().isoformat(),
     })
     logger.info(f"  [SCAN] Watchlist: {len(config.WATCHLIST)} stocks")
@@ -243,6 +302,7 @@ def run_trading_cycle(
     use_ai: bool = True,
     allow_new_entries: bool = True,
     symbol_cooldown: dict[str, datetime] | None = None,
+    stale_counts: dict[str, int] | None = None,
 ) -> None:
     """Run a single trading cycle against one or more portfolios.
 
@@ -366,6 +426,20 @@ def run_trading_cycle(
                 except (TypeError, ValueError):
                     pass
             fresh_signals.append(sig)
+
+        # Update per-symbol staleness — actionable means BUY/SELL with raw
+        # confidence >= 0.50 from any source. Symbols that keep coming back
+        # as HOLD (or low-confidence) get rotated out by the scanner.
+        if stale_counts is not None:
+            actionable_syms = {
+                s["symbol"] for s in fresh_signals
+                if s.get("signal") in ("BUY", "SELL") and s.get("confidence", 0) >= 0.50
+            }
+            for sym in config.WATCHLIST:
+                if sym in actionable_syms:
+                    stale_counts[sym] = 0
+                else:
+                    stale_counts[sym] = stale_counts.get(sym, 0) + 1
 
         for active_trader in traders:
             # Per-portfolio confidence threshold — eval runs more aggressive.
@@ -551,8 +625,17 @@ def run_autopilot(interval_min: int = 15, use_ai: bool = True, force: bool = Fal
     traders = [PaperTrader(name=name) for name in config.PORTFOLIOS.keys()]
     trader = traders[0]  # keep `trader` alias for legacy references below
     logger.info(f"  Portfolios: {', '.join(f'{t.name}=Rs.{t.initial_capital:,.0f}' for t in traders)}")
+
+    # Restore cycle count across restarts so SCAN_EVERY_N_CYCLES math, the
+    # 10-cycle performance report cadence, and per-symbol staleness keep
+    # accumulating instead of resetting on every service restart.
     cycle = 0
-    cycle_file = os.path.join(config.PROJECT_DIR, "logs", "cycle_count.txt")
+    try:
+        with open(CYCLE_COUNT_FILE) as cf:
+            cycle = int(cf.read().strip())
+        logger.info(f"  [INIT] Restored cycle counter from disk: {cycle}")
+    except (OSError, ValueError):
+        pass
     last_train_date = None
     SCAN_EVERY_N_CYCLES = 3  # Every 3 cycles = 45 min at 15-min interval
 
@@ -562,6 +645,10 @@ def run_autopilot(interval_min: int = 15, use_ai: bool = True, force: bool = Fal
     if saved_watchlist and isinstance(saved_watchlist, list) and len(saved_watchlist) >= MIN_WATCHLIST:
         config.WATCHLIST = saved_watchlist
         logger.info(f"  [SCAN] Restored watchlist from last session: {len(config.WATCHLIST)} stocks")
+    # Restore per-symbol staleness so the rotation accumulates across restarts.
+    stale_counts: dict[str, int] = saved_state.get("stale_counts", {})
+    if stale_counts:
+        logger.info(f"  [SCAN] Restored staleness for {len(stale_counts)} symbols")
     day_start_equity: float | None = None
     day_ref: datetime.date | None = None
     symbol_cooldown: dict[str, datetime] = {}
@@ -608,18 +695,24 @@ def run_autopilot(interval_min: int = 15, use_ai: bool = True, force: bool = Fal
                 logger.info(f"  [CONFIG] Hot-reloaded: {', '.join(changed)}")
 
             cycle += 1
-            # Persist cycle count so API can read it without log parsing
+            # Persist cycle count so it survives restarts and the API can
+            # read it without log parsing.
             try:
-                with open(cycle_file, "w") as cf:
+                with open(CYCLE_COUNT_FILE, "w") as cf:
                     cf.write(str(cycle))
             except Exception:
                 pass
 
-            # Trending stock scan: at market start (cycle 1) then every 3 cycles (45 min)
-            if cycle == 1 or cycle % SCAN_EVERY_N_CYCLES == 0:
+            # Trending stock scan: every 3 cycles (45 min) — uses staleness
+            # tracking to evict symbols that have stopped producing signals.
+            if cycle % SCAN_EVERY_N_CYCLES == 0 or not config.WATCHLIST:
                 try:
                     logger.info(f"  [SCAN] Watchlist update (cycle {cycle})...")
-                    scan_trending_stocks(held_symbols=set(trader.portfolio.positions.keys()), cycle_num=cycle)
+                    scan_trending_stocks(
+                        held_symbols=set(trader.portfolio.positions.keys()),
+                        cycle_num=cycle,
+                        stale_counts=stale_counts,
+                    )
                 except Exception as e:
                     logger.error(f"  [SCAN] Error: {e}")
             prices = get_watchlist_prices()
@@ -643,6 +736,7 @@ def run_autopilot(interval_min: int = 15, use_ai: bool = True, force: bool = Fal
                 use_ai=use_ai,
                 allow_new_entries=allow_new_entries,
                 symbol_cooldown=symbol_cooldown,
+                stale_counts=stale_counts,
             )
 
             # Show daily performance report every 10 cycles (per portfolio)
