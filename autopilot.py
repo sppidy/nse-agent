@@ -406,23 +406,29 @@ def run_trading_cycle(
                             logger.info(f"  [RISK] [{active_trader.name}] Cooldown active for {symbol}; skipping re-entry")
                             continue
 
-                        # Pre-entry validation: volume + divergence + resistance check
+                        # Pre-entry validation: volume + divergence + resistance check.
+                        # All column accesses guard against missing indicators —
+                        # raw OHLCV dataframes (no rsi/volume_sma) shouldn't crash
+                        # the cycle, just skip the check.
                         if not df.empty and len(df) >= 10:
                             _latest = df.iloc[-1]
-                            _vol_sma = _latest.get("volume_sma")
-                            if pd.notna(_vol_sma) and _vol_sma > 0:
-                                _vol_ratio = _latest["Volume"] / _vol_sma
-                                if _vol_ratio < 0.8:
-                                    logger.info(f"  [FILTER] {symbol} BUY blocked: low volume ({_vol_ratio:.1f}x avg)")
-                                    continue
+                            if "volume_sma" in df.columns:
+                                _vol_sma = _latest.get("volume_sma")
+                                if pd.notna(_vol_sma) and _vol_sma > 0:
+                                    _vol_ratio = _latest["Volume"] / _vol_sma
+                                    if _vol_ratio < 0.8:
+                                        logger.info(f"  [FILTER] {symbol} BUY blocked: low volume ({_vol_ratio:.1f}x avg)")
+                                        continue
                             # RSI divergence guard
-                            _rsi_now = _latest.get("rsi")
-                            _rsi_5d = df["rsi"].iloc[-5] if len(df) >= 5 and pd.notna(df["rsi"].iloc[-5]) else None
-                            _price_5d = float(df["Close"].iloc[-5]) if len(df) >= 5 else 0
-                            if pd.notna(_rsi_now) and _rsi_5d and _price_5d > 0:
-                                if price > _price_5d and _rsi_now < _rsi_5d - 3:
-                                    logger.info(f"  [FILTER] {symbol} BUY blocked: bearish RSI divergence (price up, RSI {_rsi_now:.0f} < {_rsi_5d:.0f})")
-                                    continue
+                            if "rsi" in df.columns and len(df) >= 5:
+                                _rsi_now = _latest.get("rsi")
+                                _rsi_5d_val = df["rsi"].iloc[-5]
+                                _rsi_5d = _rsi_5d_val if pd.notna(_rsi_5d_val) else None
+                                _price_5d = float(df["Close"].iloc[-5])
+                                if pd.notna(_rsi_now) and _rsi_5d and _price_5d > 0:
+                                    if price > _price_5d and _rsi_now < _rsi_5d - 3:
+                                        logger.info(f"  [FILTER] {symbol} BUY blocked: bearish RSI divergence (price up, RSI {_rsi_now:.0f} < {_rsi_5d:.0f})")
+                                        continue
                             # Near-resistance guard
                             _high_20d = float(df["High"].tail(20).max())
                             if _high_20d > 0 and ((_high_20d - price) / price) < 0.015:
