@@ -374,9 +374,17 @@ def run_trading_cycle(
                 config.PORTFOLIO_CONFIDENCE_THRESHOLD["main"],
             )
             confidence_threshold = portfolio_thresholds.get(regime_key, 0.72)
+            # Per-portfolio ML override — eval lets the immature CatBoost
+            # actually influence trades so we can measure its live performance.
+            ml_override = config.PORTFOLIO_ML_OVERRIDE.get(active_trader.name, False)
+            trader_ml_active = ml_mature or ml_override
+            ml_status = "ACTIVE" if trader_ml_active else "OBSERVING"
+            if ml_override and not ml_mature:
+                ml_status += " (override: immature model)"
             logger.info(
                 f"  └─ portfolio={active_trader.name} "
-                f"(capital=Rs.{active_trader.initial_capital:,.0f}, threshold={confidence_threshold:.2f})"
+                f"(capital=Rs.{active_trader.initial_capital:,.0f}, "
+                f"threshold={confidence_threshold:.2f}, ML={ml_status})"
             )
             for sig in fresh_signals:
                 active_trader.refresh_portfolio()
@@ -384,9 +392,9 @@ def run_trading_cycle(
                 signal = sig.get("signal", "HOLD")
                 confidence = sig.get("confidence", 0)
 
-                # Cross-validate with ML model — only if mature
+                # Cross-validate with ML model — per-portfolio maturity flag
                 ml = ml_predictions.get(symbol, {})
-                confidence_adj, ml_agrees = _adjust_confidence(confidence, signal, ml, ml_mature, regime)
+                confidence_adj, ml_agrees = _adjust_confidence(confidence, signal, ml, trader_ml_active, regime)
 
                 if confidence_adj < confidence_threshold:
                     continue
