@@ -133,19 +133,27 @@ def _adjust_confidence(confidence: float, signal: str, ml: dict, ml_mature: bool
         ml_dir = ml.get("prediction", "?")
         ml_agrees = (signal == "BUY" and ml_dir == "UP") or (signal == "SELL" and ml_dir == "DOWN")
 
-    if regime == "BEAR" and signal == "BUY":
-        adjusted *= 0.85
-    elif regime == "BULL" and signal == "BUY":
+    # Regime nudges — modest only. The hard threshold bump in BEAR already
+    # filters weak signals; layering a 0.85x penalty on top was
+    # double-punishment and blocked nearly all BUYs.
+    if regime == "BULL" and signal == "BUY":
         adjusted = min(adjusted * 1.03, 1.0)
 
     return max(0.0, min(adjusted, 1.0)), ml_agrees
 
 
-def _sized_position_pct(ai_size_pct: float, adjusted_conf: float, regime: str) -> float:
-    # Conservative sizing: AI suggests, but hard caps protect capital.
-    conf_cap = 0.05 if adjusted_conf < 0.75 else 0.08 if adjusted_conf < 0.85 else 0.10
-    regime_cap = 0.05 if regime == "BEAR" else 0.10
-    return max(0.01, min(ai_size_pct, conf_cap, regime_cap, config.MAX_POSITION_SIZE_PCT))
+def _sized_position_pct(ai_size_pct: float, adjusted_conf: float, regime: str, hard_cap: float | None = None) -> float:
+    """Conservative sizing relative to the portfolio's hard cap.
+
+    `hard_cap` comes from the active portfolio's `max_position_size_pct` — a
+    Rs.10k eval portfolio uses a bigger fraction (25%) so it can actually
+    afford 1+ share of the stocks it trades, while main stays at 10%.
+    """
+    if hard_cap is None:
+        hard_cap = config.MAX_POSITION_SIZE_PCT
+    conf_frac = 0.5 if adjusted_conf < 0.75 else 0.8 if adjusted_conf < 0.85 else 1.0
+    regime_frac = 0.5 if regime == "BEAR" else 1.0
+    return max(0.01, min(ai_size_pct, hard_cap * conf_frac, hard_cap * regime_frac, hard_cap))
 
 
 def scan_trending_stocks(held_symbols: set[str] | None = None, cycle_num: int = 0) -> list[str]:
@@ -401,8 +409,14 @@ def run_trading_cycle(
                                 logger.info(f"  [FILTER] {symbol} BUY blocked: within 1.5% of 20D resistance ({_high_20d:.2f})")
                                 continue
 
+                        portfolio_cap = active_trader.max_position_size_pct
                         ai_size_pct = float(sig.get("position_size_pct", 0.05))
-                        ai_size_pct = _sized_position_pct(max(0.01, min(ai_size_pct, 0.10)), confidence_adj, regime)
+                        ai_size_pct = _sized_position_pct(
+                            max(0.01, min(ai_size_pct, portfolio_cap)),
+                            confidence_adj,
+                            regime,
+                            hard_cap=portfolio_cap,
+                        )
                         logger.info(f"  [AI][{active_trader.name}] {sig.get('reason', '')} ({ml_tag})")
                         order = active_trader.buy(
                             symbol,
