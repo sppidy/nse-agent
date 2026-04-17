@@ -284,8 +284,16 @@ def run_trading_cycle(
             logger.warning(f"  [AI] AI unavailable ({e}). Falling back to rule-based signals.")
             signals = []
 
-        if not signals:
-            logger.info("  [AI] No AI signals returned. Running multi-indicator fallback...")
+        # Fall back to rule-based scoring when AI returns nothing OR returns
+        # all HOLD. Some weaker free-tier models default the entire watchlist
+        # to HOLD which silently freezes both portfolios for days at a time.
+        actionable = [s for s in signals if s.get("signal") in ("BUY", "SELL")]
+        if not actionable:
+            if signals:
+                logger.info(f"  [AI] All {len(signals)} signals were HOLD — running rule-based fallback for actionable trades.")
+            else:
+                logger.info("  [AI] No AI signals returned. Running multi-indicator fallback...")
+            signals = []  # rebuild from rule engine below
             for symbol in config.WATCHLIST:
                 df = get_historical_data(symbol, period="30d", interval="1d")
                 if df.empty:
