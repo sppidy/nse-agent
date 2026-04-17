@@ -299,8 +299,11 @@ def run_trading_cycle(
                 if df.empty:
                     continue
                 sig = get_scored_signal(symbol, df)
-                if sig["signal"] in ("BUY", "SELL") and sig["confidence"] >= 0.70:
-                    # Scale position size conservatively from confidence
+                if sig["signal"] in ("BUY", "SELL") and sig["confidence"] >= 0.55:
+                    # Lowered from 0.70 → 0.55 so eval (loose threshold) has
+                    # candidates to act on. Each portfolio still applies its
+                    # own confidence_threshold downstream, so main remains
+                    # conservative while eval gets the extra surface area.
                     size_pct = max(0.02, min(sig["confidence"] * 0.08, 0.06))
                     signals.append({
                         "symbol": symbol,
@@ -335,16 +338,16 @@ def run_trading_cycle(
                 if "error" not in pred:
                     ml_predictions[symbol] = pred
 
-        # Market Regime Check
+        # Market Regime Check — main keeps strict thresholds; eval and any
+        # other portfolio resolve their own regime threshold below.
         regime = get_market_regime()
-        confidence_threshold = 0.72
+        regime_key = regime if regime in ("BULL", "BEAR") else "NEUTRAL"
         if regime == "BEAR":
-            logger.warning(f"  [REGIME] BEAR Market detected ({config.MARKET_INDEX} below 200-day SMA). Confidence threshold raised to 0.82.")
-            confidence_threshold = 0.82
+            logger.warning(f"  [REGIME] BEAR Market detected ({config.MARKET_INDEX} below 200-day SMA).")
         elif regime == "BULL":
-            logger.info(f"  [REGIME] BULL Market detected ({config.MARKET_INDEX} above 50-day & 200-day SMA). Threshold: {confidence_threshold}")
+            logger.info(f"  [REGIME] BULL Market detected ({config.MARKET_INDEX} above 50-day & 200-day SMA).")
         else:
-            logger.info(f"  [REGIME] NEUTRAL Market detected. Threshold: {confidence_threshold}")
+            logger.info(f"  [REGIME] NEUTRAL Market detected.")
 
         # Step 3: Combine AI + ML and execute trades — fan out to every portfolio
         logger.info("  [3/4] Executing trades...")
@@ -365,7 +368,16 @@ def run_trading_cycle(
             fresh_signals.append(sig)
 
         for active_trader in traders:
-            logger.info(f"  └─ portfolio={active_trader.name} (capital=Rs.{active_trader.initial_capital:,.0f})")
+            # Per-portfolio confidence threshold — eval runs more aggressive.
+            portfolio_thresholds = config.PORTFOLIO_CONFIDENCE_THRESHOLD.get(
+                active_trader.name,
+                config.PORTFOLIO_CONFIDENCE_THRESHOLD["main"],
+            )
+            confidence_threshold = portfolio_thresholds.get(regime_key, 0.72)
+            logger.info(
+                f"  └─ portfolio={active_trader.name} "
+                f"(capital=Rs.{active_trader.initial_capital:,.0f}, threshold={confidence_threshold:.2f})"
+            )
             for sig in fresh_signals:
                 active_trader.refresh_portfolio()
                 symbol = sig["symbol"]

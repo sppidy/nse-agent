@@ -20,6 +20,21 @@ load_dotenv()
 _MIN_DELAY_BETWEEN_CALLS = 2  # seconds between API calls (Groq is fast)
 _MAX_RETRIES = 3
 
+# Session-level provider circuit breaker. When a provider returns 402
+# ("no credits") or persistently fails, we cool it off so the cascade
+# doesn't waste 25-30 seconds per cycle retrying a known-dead endpoint.
+import time as _time
+_PROVIDER_COOLDOWN_UNTIL: dict[str, float] = {}
+_PROVIDER_COOLDOWN_SEC = 30 * 60  # 30 minutes
+
+def _provider_alive(name: str) -> bool:
+    until = _PROVIDER_COOLDOWN_UNTIL.get(name, 0)
+    return _time.time() >= until
+
+def _mark_provider_down(name: str, seconds: int = _PROVIDER_COOLDOWN_SEC) -> None:
+    _PROVIDER_COOLDOWN_UNTIL[name] = _time.time() + seconds
+    logger.warning(f"    [CIRCUIT] {name} parked for {seconds//60} min (no credits / persistent failure)")
+
 # Copilot proxy (GitHub Copilot -> OpenAI-compatible API on localhost)
 _COPILOT_PROXY_URL = os.getenv("COPILOT_PROXY_URL", "http://localhost:4141/v1")
 _COPILOT_MODELS = [
@@ -327,8 +342,8 @@ async def _call_copilot_async(prompt: str, retries: int = _MAX_RETRIES, want_jso
                 payload = {
                     "model": model,
                     "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.3,
-                    "max_tokens": 4096,
+                    "temperature": 0.2,
+                    "max_tokens": 1500,
                 }
                 async with httpx.AsyncClient(timeout=60.0) as client:
                     resp = await client.post(
@@ -361,7 +376,14 @@ async def _call_copilot_async(prompt: str, retries: int = _MAX_RETRIES, want_jso
                         break
                 elif "connect" in error_str.lower() or "refused" in error_str.lower():
                     logger.warning(f"    Copilot proxy unavailable: {e}")
+                    _mark_provider_down("copilot")
                     raise Exception("Copilot proxy not running")
+                elif "402" in error_str or "insufficient" in error_str.lower():
+                    # No credits — moving on to the next model is pointless
+                    # if every Copilot model goes through the same proxy quota.
+                    logger.warning(f"    Copilot/{model} no credits (402), parking provider")
+                    _mark_provider_down("copilot")
+                    raise Exception("Copilot proxy out of credits")
                 else:
                     logger.warning(f"    Copilot/{model} error: {e}")
                     if attempt < retries - 1:
@@ -385,8 +407,8 @@ async def _call_openrouter_async(prompt: str, retries: int = _MAX_RETRIES, want_
                 payload = {
                     "model": model,
                     "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.3,
-                    "max_tokens": 4096,
+                    "temperature": 0.2,
+                    "max_tokens": 1500,
                 }
                 async with httpx.AsyncClient(timeout=60.0) as client:
                     resp = await client.post(
@@ -494,17 +516,22 @@ async def _call_gemini_async(client, prompt: str, retries: int = _MAX_RETRIES, r
 async def _call_ai_async(prompt: str, want_json: bool = False) -> str | list[SignalSchema]:
     """Copilot/Haiku -> OpenRouter -> Groq -> Cloudflare -> Gemini."""
     # 1. Copilot proxy (Claude Haiku via GitHub Copilot — free, smart)
-    try:
-        return await _call_copilot_async(prompt, want_json=want_json)
-    except Exception as e:
-        logger.warning(f"    Copilot failed, trying OpenRouter: {e}")
+    if _provider_alive("copilot"):
+        try:
+            return await _call_copilot_async(prompt, want_json=want_json)
+        except Exception as e:
+            logger.warning(f"    Copilot failed, trying OpenRouter: {e}")
+    else:
+        logger.info("    [CIRCUIT] Copilot in cooldown — skipping straight to OpenRouter")
 
     # 2. OpenRouter (many models, cheap/free)
-    if os.getenv("OPENROUTER_API_KEY"):
+    if os.getenv("OPENROUTER_API_KEY") and _provider_alive("openrouter"):
         try:
             return await _call_openrouter_async(prompt, want_json=want_json)
         except Exception as e:
             logger.warning(f"    OpenRouter failed, trying Groq: {e}")
+    elif not _provider_alive("openrouter"):
+        logger.info("    [CIRCUIT] OpenRouter in cooldown — skipping to Groq")
 
     # 3. Groq (free, fast)
     if os.getenv("GROQ_API_KEY"):
@@ -686,42 +713,25 @@ async def analyze_batch_async(stock_data: list[tuple[str, pd.DataFrame]]) -> lis
 
     symbol_list = ", ".join(f'"{s}"' for s in symbols)
 
-    prompt = f"""You are a CONSERVATIVE quantitative trading analyst for NSE Indian stocks. Your job is to find HIGH-PROBABILITY setups only. When in doubt, signal HOLD.
+    prompt = f"""NSE intraday signals. Be decisive — return BUY or SELL when 2+ indicators confirm. HOLD only when truly mixed.
 
 {learning}
 
 {news_context}
 
-STOCKS DATA:
+STOCKS:
 {all_summaries}
 
-PORTFOLIO: Rs.{config.INITIAL_CAPITAL} capital, max {config.MAX_POSITION_SIZE_PCT*100}% per position, {config.STOP_LOSS_PCT*100}% stop loss, {config.TAKE_PROFIT_PCT*100}% take profit.
+RULES (terse):
+- BUY when 2+ of: RSI<40 oversold rebound, EMA9>EMA21 cross, MACD bullish, volume>1.0x avg, near 20D support.
+- SELL when 2+ of: RSI>70 overbought, EMA9<EMA21 cross, MACD bearish, breakdown below support.
+- Skip BUY if within 1.5% of 20D resistance. Skip SELL if within 1.5% of 20D support.
+- Bearish news = lean HOLD/SELL.
+- Position size 0.03–0.08; never >0.10.
 
-STRICT RULES — you MUST follow these:
-1. ONLY signal BUY/SELL if AT LEAST 3 of these independently confirm: RSI, EMA trend, MACD, Bollinger Bands, volume, support/resistance, news sentiment.
-2. If RSI DIVERGENCE is present (price up but RSI down, or vice versa), it is a STRONG warning — reduce confidence by 0.15 or flip to HOLD.
-3. Do NOT signal BUY if price is within 1.5% of 20D resistance. Do NOT signal SELL if price is within 1.5% of 20D support.
-4. Volume must be >1.0x average for a BUY signal. Low volume BUY = HOLD.
-5. HOLD is always the safe default. A mediocre BUY is worse than no trade. If unsure, signal HOLD with confidence 0.
-6. Confidence below 0.72 means HOLD — do not waste a signal on low-confidence setups.
-7. NEWS SENTIMENT: bearish news = automatic HOLD or SELL. Never BUY against negative news.
-8. BEAR market = no BUY signals below 0.80 confidence. Be extremely selective.
-9. Position size: use 0.03-0.05 for moderate confidence, 0.06-0.08 for strong setups. NEVER exceed 0.10.
-10. Use trade history to avoid repeating losing patterns and favor winning setups.
-
-OUTPUT: Return a JSON object with a "signals" key containing an array of exactly {len(symbols)} objects, one per stock.
-Example format: {{"signals": [...]}}
-Each object MUST have these fields:
-- "symbol": string (use exact symbol including .NS suffix: {symbol_list})
-- "signal": "BUY" or "SELL" or "HOLD"
-- "confidence": number 0.0 to 1.0 (use 0.0 for HOLD, 0.72+ for actionable signals)
-- "position_size_pct": number 0.01 to 0.10 (conservative sizing)
-- "reason": string (MUST list which indicators confirm, e.g. "RSI oversold + MACD bullish cross + volume 2.1x = 3 confirmations")
-- "entry_price": number or null
-- "stop_loss": number or null
-- "target": number or null
-
-Return ONLY valid JSON. No markdown, no explanation.
+OUTPUT: ONE JSON object {{"signals": [...]}}, exactly {len(symbols)} entries, one per symbol in: {symbol_list}.
+Fields per entry: symbol, signal (BUY/SELL/HOLD), confidence (0.0–1.0), position_size_pct (0.01–0.10), reason (≤12 words), entry_price, stop_loss, target.
+NO markdown, NO commentary. Just the JSON.
 """
 
     try:
