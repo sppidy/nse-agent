@@ -1,4 +1,4 @@
-"""AI-powered trading strategy — Copilot/Haiku -> OpenRouter -> Groq -> Cloudflare -> Gemini."""
+"""AI-powered trading strategy — Copilot/Haiku -> Ollama -> OpenRouter -> Groq -> Cloudflare -> Gemini."""
 
 import os
 import json
@@ -40,6 +40,12 @@ _COPILOT_PROXY_URL = os.getenv("COPILOT_PROXY_URL", "http://localhost:4141/v1")
 _COPILOT_MODELS = [
     "claude-haiku-4.5",    # Fast, smart, free via Copilot
     "gpt-4o-mini",         # Cheap fallback
+]
+
+# Ollama (self-hosted on self-hosted, OpenAI-compatible)
+_OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://BACKEND_HOST:11434/v1")
+_OLLAMA_MODELS = [
+    os.getenv("OLLAMA_MODEL", "gemma4:e4b"),
 ]
 
 # OpenRouter (OpenAI-compatible, many free/cheap models)
@@ -393,6 +399,56 @@ async def _call_copilot_async(prompt: str, retries: int = _MAX_RETRIES, want_jso
     raise Exception("All Copilot models exhausted")
 
 
+async def _call_ollama_async(prompt: str, retries: int = _MAX_RETRIES, want_json: bool = False) -> str | list[SignalSchema]:
+    """Call Ollama (OpenAI-compatible) on self-hosted server."""
+    import httpx
+
+    for model in _OLLAMA_MODELS:
+        for attempt in range(retries):
+            try:
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3,
+                    "max_tokens": 4096,
+                }
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    resp = await client.post(
+                        f"{_OLLAMA_BASE_URL}/chat/completions",
+                        json=payload,
+                        headers={"Content-Type": "application/json"},
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+
+                text = data["choices"][0]["message"]["content"].strip()
+
+                if want_json:
+                    signals = _parse_signals_from_text(text)
+                    if signals:
+                        logger.info(f"    Ollama/{model}: parsed {len(signals)} signals")
+                        return signals
+                    logger.warning(f"    Ollama/{model}: didn't yield signals, trying next model")
+                    break
+                return text
+            except Exception as e:
+                error_str = str(e)
+                if "connect" in error_str.lower() or "refused" in error_str.lower() or "timeout" in error_str.lower():
+                    logger.warning(f"    Ollama unavailable: {e}")
+                    _mark_provider_down("ollama")
+                    raise Exception("Ollama server not reachable")
+                elif "404" in error_str or "not_found" in error_str.lower():
+                    logger.warning(f"    Ollama/{model} not found, trying next model...")
+                    break
+                else:
+                    logger.warning(f"    Ollama/{model} error: {e}")
+                    if attempt < retries - 1:
+                        await asyncio.sleep(_MIN_DELAY_BETWEEN_CALLS)
+                    else:
+                        break
+    raise Exception("All Ollama models exhausted")
+
+
 async def _call_openrouter_async(prompt: str, retries: int = _MAX_RETRIES, want_json: bool = False) -> str | list[SignalSchema]:
     """Call OpenRouter API (OpenAI-compatible)."""
     import httpx
@@ -514,17 +570,26 @@ async def _call_gemini_async(client, prompt: str, retries: int = _MAX_RETRIES, r
 
 
 async def _call_ai_async(prompt: str, want_json: bool = False) -> str | list[SignalSchema]:
-    """Copilot/Haiku -> OpenRouter -> Groq -> Cloudflare -> Gemini."""
+    """Copilot/Haiku -> Ollama -> OpenRouter -> Groq -> Cloudflare -> Gemini."""
     # 1. Copilot proxy (Claude Haiku via GitHub Copilot — free, smart)
     if _provider_alive("copilot"):
         try:
             return await _call_copilot_async(prompt, want_json=want_json)
         except Exception as e:
-            logger.warning(f"    Copilot failed, trying OpenRouter: {e}")
+            logger.warning(f"    Copilot failed, trying Ollama: {e}")
     else:
-        logger.info("    [CIRCUIT] Copilot in cooldown — skipping straight to OpenRouter")
+        logger.info("    [CIRCUIT] Copilot in cooldown — skipping straight to Ollama")
 
-    # 2. OpenRouter (many models, cheap/free)
+    # 2. Ollama (self-hosted on self-hosted, free)
+    if _provider_alive("ollama"):
+        try:
+            return await _call_ollama_async(prompt, want_json=want_json)
+        except Exception as e:
+            logger.warning(f"    Ollama failed, trying OpenRouter: {e}")
+    else:
+        logger.info("    [CIRCUIT] Ollama in cooldown — skipping to OpenRouter")
+
+    # 3. OpenRouter (many models, cheap/free)
     if os.getenv("OPENROUTER_API_KEY") and _provider_alive("openrouter"):
         try:
             return await _call_openrouter_async(prompt, want_json=want_json)
@@ -533,21 +598,21 @@ async def _call_ai_async(prompt: str, want_json: bool = False) -> str | list[Sig
     elif not _provider_alive("openrouter"):
         logger.info("    [CIRCUIT] OpenRouter in cooldown — skipping to Groq")
 
-    # 3. Groq (free, fast)
+    # 4. Groq (free, fast)
     if os.getenv("GROQ_API_KEY"):
         try:
             return await _call_groq_async(prompt, want_json=want_json)
         except Exception as e:
             logger.warning(f"    Groq failed, trying Cloudflare: {e}")
 
-    # 4. Cloudflare Workers AI (10K neurons/day free)
+    # 5. Cloudflare Workers AI (10K neurons/day free)
     if os.getenv("CLOUDFLARE_API_TOKEN"):
         try:
             return await _call_cloudflare_async(prompt, want_json=want_json)
         except Exception as e:
             logger.warning(f"    Cloudflare failed, falling back to Gemini: {e}")
 
-    # 5. Gemini (final fallback)
+    # 6. Gemini (final fallback)
     gemini_client = _get_gemini_client()
     if gemini_client:
         schema = list[SignalSchema] if want_json else None
