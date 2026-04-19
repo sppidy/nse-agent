@@ -412,7 +412,7 @@ async def _call_ollama_async(prompt: str, retries: int = _MAX_RETRIES, want_json
                     "temperature": 0.3,
                     "max_tokens": 4096,
                 }
-                async with httpx.AsyncClient(timeout=60.0) as client:
+                async with httpx.AsyncClient(timeout=240.0) as client:
                     resp = await client.post(
                         f"{_OLLAMA_BASE_URL}/chat/completions",
                         json=payload,
