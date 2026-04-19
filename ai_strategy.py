@@ -45,7 +45,7 @@ _COPILOT_MODELS = [
 # Ollama (self-hosted on self-hosted, OpenAI-compatible)
 _OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://BACKEND_HOST:11434/v1")
 _OLLAMA_MODELS = [
-    os.getenv("OLLAMA_MODEL", "gemma4:e4b"),
+    os.getenv("OLLAMA_MODEL", "nemotron-3-nano:4b"),
 ]
 
 # OpenRouter (OpenAI-compatible, many free/cheap models)
