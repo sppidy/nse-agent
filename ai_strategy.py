@@ -580,14 +580,16 @@ async def _call_ai_async(prompt: str, want_json: bool = False) -> str | list[Sig
     else:
         logger.info("    [CIRCUIT] Copilot in cooldown — skipping straight to Ollama")
 
-    # 2. Ollama (self-hosted on self-hosted, free)
-    if _provider_alive("ollama"):
-        try:
-            return await _call_ollama_async(prompt, want_json=want_json)
-        except Exception as e:
-            logger.warning(f"    Ollama failed, trying OpenRouter: {e}")
-    else:
-        logger.info("    [CIRCUIT] Ollama in cooldown — skipping to OpenRouter")
+    # 2. Ollama (self-hosted on self-hosted, free) — CPU-only, too slow for batch
+    #    signal scans (~1.9 tok/s); chat-path only.
+    if not want_json:
+        if _provider_alive("ollama"):
+            try:
+                return await _call_ollama_async(prompt, want_json=want_json)
+            except Exception as e:
+                logger.warning(f"    Ollama failed, trying OpenRouter: {e}")
+        else:
+            logger.info("    [CIRCUIT] Ollama in cooldown — skipping to OpenRouter")
 
     # 3. OpenRouter (many models, cheap/free)
     if os.getenv("OPENROUTER_API_KEY") and _provider_alive("openrouter"):
