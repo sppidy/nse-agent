@@ -135,7 +135,6 @@ Both agents share: `data_fetcher`, `backtester`, `paper_trader`, `learner`, `mar
 ## External services
 
 - **yfinance** — OHLCV data for both markets.
-- **Gemini API (Google)** — AI signals, chat, portfolio advice.
-- **Groq API** — Alternative LLM provider.
+- **LLM cascade** (see `ai_strategy.py` in each agent + chat path in each backend): Copilot/Haiku → **Ollama (`gemma4:e4b` @ `http://BACKEND_HOST:11434`, self-hosted on self-hosted)** → OpenRouter → Groq → Cloudflare → Gemini. Override Ollama with env vars `OLLAMA_BASE_URL` / `OLLAMA_MODEL`.
 - **Kaggle API** — Remote model training (NSE CatBoost retraining).
 - **Brokers** (expected integrations, not fully wired yet): Groww, HDFC Sky for NSE; TBD for Forex.
