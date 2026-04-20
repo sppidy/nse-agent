@@ -125,14 +125,36 @@ def get_live_price(symbol: str) -> float | None:
 
 
 def get_watchlist_prices(watchlist: list[str] | None = None) -> dict[str, float]:
-    """Get current prices for all watchlist stocks."""
+    """Get current prices for all watchlist stocks.
+
+    Batches via Groww's multi-symbol LTP endpoint (one request per 50 symbols)
+    so we don't trip the rate limiter on big watchlists. Anything the batch
+    couldn't resolve (INDEX segment, chunk error, unknown symbol) is filled in
+    individually via yfinance fallback.
+    """
     if watchlist is None:
         watchlist = config.WATCHLIST
-    prices = {}
-    for symbol in watchlist:
-        price = get_live_price(symbol)
-        if price is not None:
-            prices[symbol] = price
+    prices: dict[str, float] = {}
+
+    # 1. Batch path — one shot via Groww
+    if groww_client and groww_client.is_configured():
+        try:
+            batch = groww_client.fetch_live_prices_batch(watchlist)
+            for sym, price in batch.items():
+                if price is not None:
+                    prices[sym] = price
+        except Exception as e:
+            logger.warning(f"Groww batch LTP failed: {e} — falling back per-symbol")
+
+    # 2. Fill missing — yfinance per symbol (indices always land here)
+    missing = [s for s in watchlist if s not in prices]
+    for symbol in missing:
+        try:
+            price = _yf_live_price(symbol)
+            if price is not None:
+                prices[symbol] = price
+        except Exception as e:
+            logger.warning(f"yfinance LTP fallback failed for {symbol}: {e}")
     return prices
 
 
