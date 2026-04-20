@@ -18,14 +18,17 @@ class TestDataFetcher(unittest.TestCase):
         ticker = Mock()
         ticker.fast_info = {"lastPrice": float("nan")}
         ticker.history.return_value = pd.DataFrame({"Close": [102.5]})
-        with patch("data_fetcher.yf.Ticker", return_value=ticker):
+        # Force yfinance path: disable Groww client for this test.
+        with patch("data_fetcher.groww_client", None), \
+             patch("data_fetcher.yf.Ticker", return_value=ticker):
             self.assertEqual(102.5, data_fetcher.get_live_price("TEST.NS"))
 
     def test_get_live_price_returns_none_for_invalid_sources(self):
         ticker = Mock()
         ticker.fast_info = {"lastPrice": float("nan")}
         ticker.history.return_value = pd.DataFrame({"Close": [float("nan")]})
-        with patch("data_fetcher.yf.Ticker", return_value=ticker):
+        with patch("data_fetcher.groww_client", None), \
+             patch("data_fetcher.yf.Ticker", return_value=ticker):
             self.assertIsNone(data_fetcher.get_live_price("TEST.NS"))
 
 

@@ -17,6 +17,8 @@ from predictor import predict, train_model, should_retrain
 from logger import logger
 from market_calendar import now_ist, is_market_trading_day, MARKET_OPEN_TIME, MARKET_CLOSE_TIME
 from persistence import read_json, write_json_atomic
+import fundamentals
+import dynamic_scan_pool
 
 
 def is_market_open() -> bool:
@@ -190,9 +192,17 @@ def scan_trending_stocks(
     for sym in current:
         held_cycles.setdefault(sym, 0)
 
-    # Score every SCAN_POOL candidate
+    # Merge the hardcoded pool with the Groww-movers snapshot (if fresh).
+    effective_pool = dynamic_scan_pool.merge_scan_pool(SCAN_POOL)
+
+    # Score every effective_pool candidate
     results = []
-    for sym in SCAN_POOL:
+    for sym in effective_pool:
+        # Fundamentals gate — cheap reject for structurally broken names
+        ok, reason = fundamentals.passes_filter(sym)
+        if not ok:
+            logger.info(f"  [SCAN] - {sym}: rejected ({reason})")
+            continue
         try:
             hist = get_historical_data(sym, period="30d", interval="1d")
             score = _trend_score(hist)
