@@ -134,7 +134,9 @@ Both agents share: `data_fetcher`, `backtester`, `paper_trader`, `learner`, `mar
 
 ## External services
 
-- **yfinance** — OHLCV data for both markets.
+- **Groww** — primary NSE data source. Live LTP + historical candles via REST (`groww_client.py`); market movers + fundamentals via Groww MCP at `https://mcp.groww.in/mcp/` (`groww_mcp.py`). Auth via `GROWW_API_KEY` (TOTP JWT) + `GROWW_TOTP_SECRET` (base32 seed). **No order code is wired — agent is paper-trade only.** Full SDK reference (methods, constants, examples) checked in at [`docs/GROWW_SDK.md`](docs/GROWW_SDK.md).
+- **yfinance** — fallback for index data (Groww doesn't serve INDEX segment) and supplementary Yahoo news + options-chain PCR in `news_sentiment.py`.
+- **pandas_market_calendars (XNSE)** — deterministic trading-day/holiday lookup in `market_calendar.py`. No API call.
 - **LLM cascade** (see `ai_strategy.py` in each agent + chat path in each backend): Copilot/Haiku → **Ollama (`nemotron-3-nano:4b` @ `http://BACKEND_HOST:11434`, self-hosted on self-hosted)** → OpenRouter → Groq → Cloudflare → Gemini. Ollama is chat-only (skipped on `want_json=True` — CPU inference is too slow for batch scans). Override with env vars `OLLAMA_BASE_URL` / `OLLAMA_MODEL`.
 - **Kaggle API** — Remote model training (NSE CatBoost retraining).
-- **Brokers** (expected integrations, not fully wired yet): Groww, HDFC Sky for NSE; TBD for Forex.
+- **Brokers** (expected integrations, not fully wired yet): Groww (read-only live data + MCP), HDFC Sky for NSE; TBD for Forex.
