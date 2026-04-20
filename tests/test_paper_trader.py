@@ -1,15 +1,15 @@
-import tempfile
 import unittest
 import math
 from unittest.mock import patch
 
 import config
 from paper_trader import PaperTrader, Portfolio, Position
+from tests.helpers import workspace_temp_dir
 
 
 class TestPaperTrader(unittest.TestCase):
     def test_buy_refreshes_portfolio_from_disk_before_save(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace_temp_dir() as tmp:
             path = f"{tmp}\\portfolio.json"
             Portfolio(cash=10000.0).save(path)
             trader = PaperTrader(filepath=path)
@@ -48,8 +48,10 @@ class TestPaperTrader(unittest.TestCase):
 
     def test_buy_uses_capital_utilization_floor_for_low_confidence(self):
         original_initial = config.INITIAL_CAPITAL
+        original_portfolios = dict(config.PORTFOLIOS)
         try:
             config.INITIAL_CAPITAL = 10000.0
+            config.PORTFOLIOS["main"] = 10000.0
             trader = PaperTrader(portfolio=Portfolio(cash=10000.0))
             with patch("paper_trader.is_market_trading_day", return_value=True), patch("paper_trader.random.uniform", return_value=1.0):
                 order = trader.buy("UTIL.NS", price=100.0, confidence=0.2, max_position_size_pct=0.10)
@@ -57,6 +59,8 @@ class TestPaperTrader(unittest.TestCase):
             self.assertGreaterEqual(order.quantity, 4)
         finally:
             config.INITIAL_CAPITAL = original_initial
+            config.PORTFOLIOS.clear()
+            config.PORTFOLIOS.update(original_portfolios)
 
     def test_buy_respects_explicit_max_position_size_pct(self):
         original_initial = config.INITIAL_CAPITAL
@@ -71,7 +75,7 @@ class TestPaperTrader(unittest.TestCase):
             config.INITIAL_CAPITAL = original_initial
 
     def test_portfolio_save_load_roundtrip(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workspace_temp_dir() as tmp:
             trader = PaperTrader(portfolio=Portfolio(cash=5000.0))
             with patch("paper_trader.is_market_trading_day", return_value=True):
                 trader.buy("TEST.NS", price=100.0, quantity=5)
