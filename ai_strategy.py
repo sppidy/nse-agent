@@ -858,7 +858,7 @@ async def analyze_watchlist_async(watchlist: list[str] | None = None) -> list[di
             df = await asyncio.to_thread(get_historical_data, symbol, period="60d", interval="1d")
             if not df.empty:
                 return (symbol, df)
-            logger.warning(f"  [AI-SCAN] {symbol}: empty data from yfinance")
+            logger.warning(f"  [AI-SCAN] {symbol}: empty market data")
             return None
         except Exception as e:
             logger.warning(f"  [AI-SCAN] {symbol}: fetch failed — {e}")

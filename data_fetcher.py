@@ -33,6 +33,9 @@ def _try_groww_candles(symbol: str, period: str, interval: str, label: str) -> p
             logger.warning(f"Groww returned empty {label} for {symbol} — falling back to yfinance")
             return None
         return df
+    except groww_client.GrowwUnsupported:
+        # Expected skip (e.g., indices). Silent fall-through — no log spam.
+        return None
     except Exception as e:
         logger.warning(f"Groww {label} failed for {symbol}: {e} — falling back to yfinance")
         return None
