@@ -239,6 +239,69 @@ def fetch_candles(symbol: str, period: str, interval: str) -> pd.DataFrame:
     return _candles_to_df(candles)
 
 
+def _clean_ltp(value) -> float | None:
+    try:
+        price = float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+    if price is None or not math.isfinite(price) or price <= 0:
+        return None
+    return price
+
+
+def fetch_live_prices_batch(symbols: list[str]) -> dict[str, float | None]:
+    """Batch LTP for many symbols in ~1 request per 50 symbols.
+
+    Returns ``{yf_symbol: price_or_None}``. Symbols in the INDEX segment
+    (e.g. ``^NSEI``) are silently omitted so callers can fall them back to
+    yfinance individually. Any HTTP error marks the whole chunk as None —
+    the caller is responsible for yfinance fallback per symbol.
+    """
+    if not is_configured():
+        raise RuntimeError("GROWW_API_KEY not set")
+
+    # Group by (exchange, segment) so one request only spans a single
+    # segment — Groww's LTP endpoint takes a single segment param.
+    by_key: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for yf_sym in symbols:
+        try:
+            trading, exchange, segment = _to_groww_symbol(yf_sym)
+        except Exception:
+            continue
+        if segment == "INDEX":
+            continue
+        by_key.setdefault((exchange, segment), []).append((yf_sym, trading))
+
+    out: dict[str, float | None] = {}
+    for (exchange, segment), items in by_key.items():
+        for i in range(0, len(items), 50):
+            chunk = items[i : i + 50]
+            keys = [f"{exchange}_{t}" for _, t in chunk]
+            params = {"segment": segment, "exchange_symbols": ",".join(keys)}
+            try:
+                r = requests.get(
+                    f"{_GROWW_BASE}/v1/live-data/ltp",
+                    params=params,
+                    headers=_headers(),
+                    timeout=15,
+                )
+                r.raise_for_status()
+                data = r.json()
+            except Exception as e:
+                logger.warning(f"Groww batch LTP chunk of {len(chunk)} failed: {e}")
+                for yf_sym, _ in chunk:
+                    out.setdefault(yf_sym, None)
+                continue
+            if data.get("status") != "SUCCESS":
+                for yf_sym, _ in chunk:
+                    out.setdefault(yf_sym, None)
+                continue
+            payload = data.get("payload") or {}
+            for yf_sym, trading in chunk:
+                out[yf_sym] = _clean_ltp(payload.get(f"{exchange}_{trading}"))
+    return out
+
+
 def fetch_live_price(symbol: str) -> float | None:
     if not is_configured():
         raise RuntimeError("GROWW_API_KEY not set")
@@ -254,11 +317,4 @@ def fetch_live_price(symbol: str) -> float | None:
     data = r.json()
     if data.get("status") != "SUCCESS":
         raise RuntimeError(f"Groww non-success for {symbol}: {data.get('error') or data}")
-    price = (data.get("payload") or {}).get(key)
-    try:
-        price = float(price)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(price) or price <= 0:
-        return None
-    return price
+    return _clean_ltp((data.get("payload") or {}).get(key))
