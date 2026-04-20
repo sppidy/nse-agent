@@ -15,6 +15,7 @@ any auth/network failure, data_fetcher falls back to yfinance.
 """
 
 import base64
+import collections
 import json
 import math
 import os
@@ -28,6 +29,75 @@ from logger import logger
 
 
 _GROWW_BASE = "https://api.groww.in"
+
+# Rate limiter — Groww's documented "Live Data" type limit is 10 rps / 300 rpm
+# (shared across LTP + OHLC + Quote + historical candles). We enforce 20% below
+# that so we never race Groww's own counter, even if multiple processes (agent
+# + backend) share the same credentials.
+_LIVE_DATA_RPS = 8
+_LIVE_DATA_RPM = 250
+
+
+class _SlidingRateLimiter:
+    """Sliding-window limiter enforcing both per-second and per-minute quotas.
+
+    `acquire()` blocks the caller until a slot is free. Safe across threads
+    inside a single process. Not coordinated across processes — each Python
+    process (agent, backend) has its own counter, so the effective cap is
+    ``rps * n_processes``. The safety buffer above absorbs that.
+    """
+
+    def __init__(self, rps: int, rpm: int) -> None:
+        self.rps = rps
+        self.rpm = rpm
+        self._times: collections.deque[float] = collections.deque()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        while True:
+            with self._lock:
+                now = time.time()
+                # Drop timestamps older than 60s (outside the minute window)
+                while self._times and now - self._times[0] > 60:
+                    self._times.popleft()
+                in_minute = len(self._times)
+                in_second = sum(1 for t in self._times if now - t <= 1.0)
+                if in_second < self.rps and in_minute < self.rpm:
+                    self._times.append(now)
+                    return
+                # Over cap — compute the shortest wait that gives us a slot
+                if in_second >= self.rps:
+                    # Oldest hit in the last second expires at self._times[-rps] + 1
+                    oldest_in_sec = self._times[-self.rps]
+                    wait = max(0.0, (oldest_in_sec + 1.0) - now)
+                else:
+                    wait = max(0.0, (self._times[0] + 60.0) - now)
+            # Sleep outside the lock. Floor at 20ms to avoid spin.
+            time.sleep(max(0.02, wait + 0.005))
+
+
+_live_data_limiter = _SlidingRateLimiter(_LIVE_DATA_RPS, _LIVE_DATA_RPM)
+
+
+def _api_get(url: str, **kwargs) -> requests.Response:
+    """`requests.get` wrapper with client-side rate limiting and one 429 retry.
+
+    Use for every hit against api.groww.in so we stay under the Live-Data
+    quota. A 429 despite the limiter means another process/agent is sharing
+    the credentials — we honor Retry-After and try once more.
+    """
+    _live_data_limiter.acquire()
+    r = requests.get(url, **kwargs)
+    if r.status_code == 429:
+        try:
+            retry_after = int(r.headers.get("Retry-After", "30"))
+        except ValueError:
+            retry_after = 30
+        logger.warning(f"Groww 429 on {url.rsplit('/', 1)[-1]} — sleeping {retry_after}s and retrying once")
+        time.sleep(retry_after)
+        _live_data_limiter.acquire()
+        r = requests.get(url, **kwargs)
+    return r
 
 _TOKEN_TTL_CAP_SECONDS = 23 * 3600  # cap — real TTL derived from JWT exp
 _TOKEN_REFRESH_GRACE_SECONDS = 60   # refresh this many seconds before exp
@@ -230,7 +300,7 @@ def fetch_candles(symbol: str, period: str, interval: str) -> pd.DataFrame:
         "end_time": str(now),
         "interval_in_minutes": str(_interval_to_minutes(interval)),
     }
-    r = requests.get(f"{_GROWW_BASE}/v1/historical/candle/range", params=params, headers=_headers(), timeout=10)
+    r = _api_get(f"{_GROWW_BASE}/v1/historical/candle/range", params=params, headers=_headers(), timeout=10)
     r.raise_for_status()
     data = r.json()
     if data.get("status") != "SUCCESS":
@@ -279,7 +349,7 @@ def fetch_live_prices_batch(symbols: list[str]) -> dict[str, float | None]:
             keys = [f"{exchange}_{t}" for _, t in chunk]
             params = {"segment": segment, "exchange_symbols": ",".join(keys)}
             try:
-                r = requests.get(
+                r = _api_get(
                     f"{_GROWW_BASE}/v1/live-data/ltp",
                     params=params,
                     headers=_headers(),
@@ -312,7 +382,7 @@ def fetch_live_price(symbol: str) -> float | None:
         raise GrowwUnsupported(f"Groww LTP doesn't support INDEX segment ({symbol})")
     key = f"{exchange}_{trading_symbol}"
     params = {"segment": segment, "exchange_symbols": key}
-    r = requests.get(f"{_GROWW_BASE}/v1/live-data/ltp", params=params, headers=_headers(), timeout=10)
+    r = _api_get(f"{_GROWW_BASE}/v1/live-data/ltp", params=params, headers=_headers(), timeout=10)
     r.raise_for_status()
     data = r.json()
     if data.get("status") != "SUCCESS":
