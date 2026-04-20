@@ -6,6 +6,10 @@
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+.pytest_cache_test/
+pytest-cache-files-*/
+tests/_tmp/
 
 # ML models — tracked in git for server deployment
 # models/
