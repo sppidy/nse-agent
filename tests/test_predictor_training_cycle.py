@@ -1,63 +1,38 @@
-import tempfile
 import unittest
-import os
-from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
 
 import predictor
-from persistence import write_json_atomic
+from tests.helpers import workspace_temp_dir
 
 
 class TestPredictorTrainingCycle(unittest.TestCase):
     def test_should_retrain_without_log(self):
-        original_log = predictor.TRAINING_LOG
+        original_model_pkl = predictor.MODEL_PKL
+        original_model_cbm = predictor.MODEL_CBM
         try:
-            with tempfile.TemporaryDirectory() as tmp:
-                predictor.TRAINING_LOG = f"{tmp}\\training_log.json"
+            with workspace_temp_dir() as tmp:
+                predictor.MODEL_PKL = f"{tmp}\\predictor_catboost.pkl"
+                predictor.MODEL_CBM = f"{tmp}\\predictor_catboost.cbm"
                 should, _reason = predictor.should_retrain(min_hours=18)
                 self.assertTrue(should)
         finally:
-            predictor.TRAINING_LOG = original_log
+            predictor.MODEL_PKL = original_model_pkl
+            predictor.MODEL_CBM = original_model_cbm
 
-    def test_should_retrain_respects_min_hours(self):
-        original_log = predictor.TRAINING_LOG
+    def test_should_retrain_skips_when_colab_model_exists(self):
+        original_model_pkl = predictor.MODEL_PKL
+        original_model_cbm = predictor.MODEL_CBM
         try:
-            with tempfile.TemporaryDirectory() as tmp:
-                predictor.TRAINING_LOG = f"{tmp}\\training_log.json"
-                now = datetime.now(timezone.utc)
-                recent = now - timedelta(hours=2)
-                old = now - timedelta(hours=25)
-
-                write_json_atomic(
-                    predictor.TRAINING_LOG,
-                    [{"timestamp": recent.isoformat(), "metrics": {"walk_forward_f1": 51.2}}],
-                )
-                should_recent, _ = predictor.should_retrain(min_hours=18)
-                self.assertFalse(should_recent)
-
-                write_json_atomic(
-                    predictor.TRAINING_LOG,
-                    [{"timestamp": old.isoformat(), "metrics": {"walk_forward_f1": 51.2}}],
-                )
-                should_old, _ = predictor.should_retrain(min_hours=18)
-                self.assertTrue(should_old)
+            with workspace_temp_dir() as tmp:
+                predictor.MODEL_PKL = f"{tmp}\\predictor_catboost.pkl"
+                predictor.MODEL_CBM = f"{tmp}\\predictor_catboost.cbm"
+                with open(predictor.MODEL_PKL, "wb") as f:
+                    f.write(b"model")
+                should, reason = predictor.should_retrain(min_hours=18)
+                self.assertFalse(should)
+                self.assertIn("Colab-trained", reason)
         finally:
-            predictor.TRAINING_LOG = original_log
-
-    def test_resolve_training_n_jobs_defaults_to_one(self):
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("ML_TRAIN_N_JOBS", None)
-            self.assertEqual(1, predictor._resolve_training_n_jobs())
-
-    def test_resolve_training_n_jobs_invalid_falls_back_to_one(self):
-        with patch.dict(os.environ, {"ML_TRAIN_N_JOBS": "abc"}, clear=False):
-            self.assertEqual(1, predictor._resolve_training_n_jobs())
-
-    def test_resolve_training_n_jobs_accepts_positive_and_minus_one(self):
-        with patch.dict(os.environ, {"ML_TRAIN_N_JOBS": "2"}, clear=False):
-            self.assertEqual(2, predictor._resolve_training_n_jobs())
-        with patch.dict(os.environ, {"ML_TRAIN_N_JOBS": "-1"}, clear=False):
-            self.assertEqual(-1, predictor._resolve_training_n_jobs())
+            predictor.MODEL_PKL = original_model_pkl
+            predictor.MODEL_CBM = original_model_cbm
 
 
 if __name__ == "__main__":
