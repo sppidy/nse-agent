@@ -1,4 +1,4 @@
-"""Fetch market data for Indian stocks using yfinance."""
+"""Fetch market data for Indian stocks — Groww primary, yfinance fallback."""
 
 import math
 import yfinance as yf
@@ -7,6 +7,11 @@ from datetime import datetime, timedelta
 import config
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from logger import logger
+
+try:
+    import groww_client
+except ImportError:  # keep data_fetcher importable if the module goes missing
+    groww_client = None
 
 
 def _clean_price(value) -> float | None:
@@ -18,25 +23,19 @@ def _clean_price(value) -> float | None:
         return None
     return price
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(Exception),
-    before_sleep=lambda retry_state: logger.warning(f"Retrying yfinance API call. Attempt {retry_state.attempt_number}")
-)
-def get_historical_data(symbol: str, period: str = "60d", interval: str = "1d") -> pd.DataFrame:
-    """Fetch historical OHLCV data for a symbol."""
+def _try_groww_candles(symbol: str, period: str, interval: str, label: str) -> pd.DataFrame | None:
+    """Return Groww-sourced OHLCV, or None if Groww isn't configured / failed."""
+    if not (groww_client and groww_client.is_configured()):
+        return None
     try:
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period=period, interval=interval)
+        df = groww_client.fetch_candles(symbol, period=period, interval=interval)
         if df.empty:
-            logger.warning(f"Warning: No data returned for {symbol}")
-            return df
-        df.index = df.index.tz_localize(None) if df.index.tz else df.index
+            logger.warning(f"Groww returned empty {label} for {symbol} — falling back to yfinance")
+            return None
         return df
     except Exception as e:
-        logger.error(f"Error fetching historical data for {symbol}: {e}")
-        raise e  # Reraise to trigger tenacity
+        logger.warning(f"Groww {label} failed for {symbol}: {e} — falling back to yfinance")
+        return None
 
 
 @retry(
@@ -45,16 +44,36 @@ def get_historical_data(symbol: str, period: str = "60d", interval: str = "1d") 
     retry=retry_if_exception_type(Exception),
     before_sleep=lambda retry_state: logger.warning(f"Retrying yfinance API call. Attempt {retry_state.attempt_number}")
 )
-def get_intraday_data(symbol: str, days: int = 5, interval: str = "5m") -> pd.DataFrame:
-    """Fetch intraday data. yfinance allows max 60 days of intraday data."""
-    try:
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period=f"{days}d", interval=interval)
-        if df.empty:
-            logger.warning(f"Warning: No intraday data for {symbol}")
-            return df
-        df.index = df.index.tz_localize(None) if df.index.tz else df.index
+def _yf_history(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    ticker = yf.Ticker(symbol)
+    df = ticker.history(period=period, interval=interval)
+    if df.empty:
+        logger.warning(f"Warning: No data returned for {symbol} ({period}/{interval})")
         return df
+    df.index = df.index.tz_localize(None) if df.index.tz else df.index
+    return df
+
+
+def get_historical_data(symbol: str, period: str = "60d", interval: str = "1d") -> pd.DataFrame:
+    """Fetch historical OHLCV — Groww first, then yfinance on failure."""
+    df = _try_groww_candles(symbol, period, interval, "historical")
+    if df is not None:
+        return df
+    try:
+        return _yf_history(symbol, period, interval)
+    except Exception as e:
+        logger.error(f"Error fetching historical data for {symbol}: {e}")
+        raise e
+
+
+def get_intraday_data(symbol: str, days: int = 5, interval: str = "5m") -> pd.DataFrame:
+    """Fetch intraday OHLCV — Groww first, then yfinance on failure."""
+    period = f"{days}d"
+    df = _try_groww_candles(symbol, period, interval, "intraday")
+    if df is not None:
+        return df
+    try:
+        return _yf_history(symbol, period, interval)
     except Exception as e:
         logger.error(f"Error fetching intraday data for {symbol}: {e}")
         raise e
@@ -66,24 +85,37 @@ def get_intraday_data(symbol: str, days: int = 5, interval: str = "5m") -> pd.Da
     retry=retry_if_exception_type(Exception),
     before_sleep=lambda retry_state: logger.warning(f"Retrying yfinance API call. Attempt {retry_state.attempt_number}")
 )
-def get_live_price(symbol: str) -> float | None:
-    """Get the latest available price for a symbol."""
+def _yf_live_price(symbol: str) -> float | None:
+    ticker = yf.Ticker(symbol)
     try:
-        ticker = yf.Ticker(symbol)
+        info = ticker.fast_info
+        if info is not None:
+            last = getattr(info, 'lastPrice', None) or (info.get("lastPrice") if hasattr(info, 'get') else None)
+            live = _clean_price(last)
+            if live is not None:
+                return live
+    except Exception:
+        pass
+    hist = ticker.history(period="1d")
+    if not hist.empty:
+        return _clean_price(hist["Close"].iloc[-1])
+    return None
+
+
+def get_live_price(symbol: str) -> float | None:
+    """Get the latest available price for a symbol — Groww LTP first, yfinance fallback."""
+    if groww_client and groww_client.is_configured():
         try:
-            info = ticker.fast_info
-            if info is not None:
-                # fast_info may be a dict-like or object — handle both
-                last = getattr(info, 'lastPrice', None) or (info.get("lastPrice") if hasattr(info, 'get') else None)
-                live = _clean_price(last)
-                if live is not None:
-                    return live
-        except Exception:
+            price = groww_client.fetch_live_price(symbol)
+            if price is not None:
+                return price
+        except groww_client.GrowwUnsupported:
+            # Expected skip (e.g., indices). Silent fall-through.
             pass
-        hist = ticker.history(period="1d")
-        if not hist.empty:
-            return _clean_price(hist["Close"].iloc[-1])
-        return None
+        except Exception as e:
+            logger.warning(f"Groww LTP failed for {symbol}: {e} — falling back to yfinance")
+    try:
+        return _yf_live_price(symbol)
     except Exception as e:
         logger.error(f"Error fetching live price for {symbol}: {e}")
         raise e
