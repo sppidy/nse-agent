@@ -83,6 +83,31 @@ Groww slug format (used in some fundamentals/MCP responses): lowercase hyphen-jo
 
 ---
 
+## 3b. Rate limits (free tier — all we have)
+
+Documented at [groww.in/trade-api/docs](https://groww.in/trade-api/docs). Limits are **per type**, not per endpoint — if any endpoint under a type is exhausted, the whole type rate-limits.
+
+| Type | Endpoints | Per second | Per minute |
+|------|-----------|-----------|------------|
+| **Live Data** | `get_ltp`, `get_ohlc`, `get_quote`, historical candles | **10** | **300** |
+| Orders | `place_order`, `modify_order`, `cancel_order` | 10 | 250 |
+| Non Trading | order list/status, positions, holdings, margin | 20 | 500 |
+
+### What we enforce
+
+`groww_client._live_data_limiter` is a sliding-window limiter capped at **8 rps / 250 rpm** (20% below Groww's Live-Data cap). Every call to `_GROWW_BASE/v1/live-data/*` or `/v1/historical/*` goes through `_api_get` which:
+1. Calls `_live_data_limiter.acquire()` — blocks until a slot is free.
+2. Issues the request.
+3. If a 429 comes back anyway (e.g., another process sharing credentials), honors `Retry-After` and retries once.
+
+**Result:** the autopilot physically cannot exceed 8 rps against Groww, so we never trip 429 in the first place. The 429 retry is belt-and-suspenders.
+
+### Per-process limiter caveat
+
+The limiter is in-memory per Python process. If the backend and the autopilot both hammer Groww in the same second, each is capped at 8 rps so they could collectively reach 16 rps — still under Groww's 10 rps. The 20% buffer specifically absorbs this. If we ever run three+ processes against shared creds, upgrade to a Redis-backed limiter.
+
+---
+
 ## 4. Live data
 
 | Method | Cap | Returns |
