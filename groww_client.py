@@ -51,19 +51,48 @@ def _jwt_exp(token: str) -> int | None:
 
 
 def _generate_access_token() -> str | None:
-    """Mint a fresh access token via Groww SDK (TOTP JWT + base32 secret). None on failure."""
+    """Mint a fresh access token via Groww SDK (TOTP JWT + base32 secret). None on failure.
+
+    Handles TOTP-window race: codes flip every 30s, and Groww rejects codes that
+    tick over mid-validation. If we're within 3s of a window boundary we wait
+    for the next tick; on any failure we retry once with a fresh code.
+    """
     api_key = os.environ.get("GROWW_API_KEY", "").strip()
     totp_secret = os.environ.get("GROWW_TOTP_SECRET", "").strip()
     if not api_key or not totp_secret:
         return None
+
     try:
         from growwapi import GrowwAPI
         import pyotp
-        totp_code = pyotp.TOTP(totp_secret).now()
-        res = GrowwAPI.get_access_token(api_key, totp=totp_code)
     except Exception as e:
-        logger.error(f"Groww SDK auth failed: {e}")
+        logger.error(f"Groww SDK import failed: {e}")
         return None
+
+    totp = pyotp.TOTP(totp_secret)
+
+    def _wait_if_window_end() -> None:
+        # If <3s remain in the current 30s window, wait for the next one.
+        pos = int(time.time()) % 30
+        if pos > 27:
+            time.sleep(31 - pos)
+
+    def _try_once() -> object:
+        _wait_if_window_end()
+        return GrowwAPI.get_access_token(api_key, totp=totp.now())
+
+    res: object
+    try:
+        res = _try_once()
+    except Exception as e:
+        logger.warning(f"Groww SDK auth 1st attempt failed: {e}; retrying after window tick…")
+        try:
+            time.sleep(max(1.0, 30 - (time.time() % 30)))
+            res = _try_once()
+        except Exception as e2:
+            logger.error(f"Groww SDK auth failed (after retry): {e2}")
+            return None
+
     # SDK docs say the return is `dict`, but in practice it returns the token
     # string directly. Handle both.
     if isinstance(res, str) and res.strip():
