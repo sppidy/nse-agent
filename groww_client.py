@@ -187,6 +187,10 @@ def fetch_candles(symbol: str, period: str, interval: str) -> pd.DataFrame:
     if not is_configured():
         raise RuntimeError("GROWW_API_KEY not set")
     trading_symbol, exchange, segment = _to_groww_symbol(symbol)
+    if segment == "INDEX":
+        # Groww's historical candle endpoint also 400s for INDEX. Skip cleanly
+        # so callers fall back to yfinance without logging a per-cycle warning.
+        raise GrowwUnsupported(f"Groww historical doesn't support INDEX segment ({symbol})")
     now = int(time.time())
     start = now - _period_to_seconds(period)
     params = {

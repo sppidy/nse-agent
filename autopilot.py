@@ -5,7 +5,6 @@ import time
 import sys
 from datetime import datetime, timedelta
 
-import yfinance as yf
 import pandas as pd
 
 import config
@@ -195,8 +194,7 @@ def scan_trending_stocks(
     results = []
     for sym in SCAN_POOL:
         try:
-            t = yf.Ticker(sym)
-            hist = t.history(period="30d")
+            hist = get_historical_data(sym, period="30d", interval="1d")
             score = _trend_score(hist)
             if score is None:
                 continue
@@ -266,8 +264,7 @@ def scan_trending_stocks(
     for sym in list(current):
         if sym in SCAN_POOL and sym not in held_symbols:
             try:
-                t = yf.Ticker(sym)
-                hist = t.history(period="5d")
+                hist = get_historical_data(sym, period="5d", interval="1d")
                 if not hist.empty and len(hist) >= 2:
                     price = hist["Close"].iloc[-1]
                     prev = hist["Close"].iloc[-2]
