@@ -329,13 +329,23 @@ def train_model(symbols: list[str] | None = None, period: str = "5y") -> dict:
     if len(combined) < 100:
         return {"error": f"Only {len(combined)} samples, need at least 100"}
 
-    X = combined[FEATURE_COLS].values
-    y = combined["target"].values
+    # Ensure features are in the exact order expected by the model
+    X = combined[FEATURE_COLS]
+    y = combined["target"]
 
     # Chronological split
     split_idx = int(len(X) * 0.85)
-    X_train, X_test = X[:split_idx], X[split_idx:]
+    X_train_raw, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
+
+    # Ensure feature order matches training to prevent mismatch error
+    print("Feature names in X_train:", list(X_train_raw.columns))
+    print("Feature name mismatch check - ensuring alignment...")
+    # Ensure feature order matches training
+    expected_features = FEATURE_COLS
+    # Reorder X_train to match expected feature order
+    X_train = X_train_raw.reindex(columns=expected_features)
+    X_test = X_test.reindex(columns=expected_features)
 
     # Load existing model for finetuning
     existing_model = _load_model()
