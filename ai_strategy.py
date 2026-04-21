@@ -349,7 +349,7 @@ async def _call_copilot_async(prompt: str, retries: int = _MAX_RETRIES, want_jso
                     "model": model,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.2,
-                    "max_tokens": 1500,
+                    "max_tokens": 4096,
                 }
                 async with httpx.AsyncClient(timeout=60.0) as client:
                     resp = await client.post(
@@ -464,7 +464,7 @@ async def _call_openrouter_async(prompt: str, retries: int = _MAX_RETRIES, want_
                     "model": model,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.2,
-                    "max_tokens": 1500,
+                    "max_tokens": 4096,
                 }
                 async with httpx.AsyncClient(timeout=60.0) as client:
                     resp = await client.post(

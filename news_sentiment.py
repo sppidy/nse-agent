@@ -190,17 +190,17 @@ def _fetch_yahoo_finance_news(symbol: str, num_results: int = 3) -> list[dict]:
         news = ticker.news or []
         articles = []
         for item in news[:num_results]:
-            content = item.get("content", {})
+            content = item.get("content") or {}
             title = content.get("title", "")
             if not title:
                 continue
-            provider = content.get("provider", {}).get("displayName", "Yahoo Finance")
+            provider = (content.get("provider") or {}).get("displayName", "Yahoo Finance")
             pub_date = content.get("pubDate", "")
             articles.append({
                 "title": _safe_str(title),
                 "source": f"Yahoo/{provider}",
                 "published": pub_date,
-                "link": content.get("clickThroughUrl", {}).get("url", ""),
+                "link": (content.get("clickThroughUrl") or {}).get("url", ""),
             })
         return articles
     except Exception as e:
