@@ -761,13 +761,20 @@ async def analyze_batch_async(stock_data: list[tuple[str, pd.DataFrame]]) -> lis
     learning = await asyncio.to_thread(get_learning_context)
 
     from news_sentiment import get_sentiment_context
+    # Sentiment analysis talks to an external LLM over the news set and is
+    # load-sensitive; 15s was too tight and dropped it out half the time.
+    # Bump to 45s so we get real signal instead of defaulting to NEUTRAL.
+    sentiment_timeout = 45.0
     try:
         news_context = await asyncio.wait_for(
             asyncio.to_thread(get_sentiment_context, symbols),
-            timeout=15.0,
+            timeout=sentiment_timeout,
         )
     except asyncio.TimeoutError:
-        logger.warning("    [NEWS] Sentiment fetch timed out (>15s); proceeding with neutral sentiment.")
+        logger.warning(
+            f"    [NEWS] Sentiment fetch timed out (>{sentiment_timeout:.0f}s); "
+            "proceeding with neutral sentiment."
+        )
         news_context = "NEWS SENTIMENT ANALYSIS: Timed out — treat all symbols as NEUTRAL sentiment."
     except Exception as exc:
         logger.warning(f"    [NEWS] Sentiment fetch failed ({exc}); proceeding with neutral sentiment.")
