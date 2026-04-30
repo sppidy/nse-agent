@@ -16,7 +16,7 @@ Code is organised across **two Windows top-level projects** (`B:\projects\ai-tra
 | 6 | Forex agent | `B:\projects\forex-trading-agent\agent` | Python trading agent for FX/commodities | ❌ | `scp` (whole dir) |
 | 7 | Forex backend | `B:\projects\forex-trading-agent\backend` | FastAPI multi-user wrapper around forex agent | ❌ | `scp` (whole dir) |
 
-Server: `ubuntu@BACKEND_HOST` (self-hosted). All NSE-side services are VPN-only.
+Server: `ubuntu@${BACKEND_HOST}`. All NSE-side services are private-network-only.
 
 ## Deployment rules — read before deploying
 
@@ -137,7 +137,7 @@ Android app  ──┼────►│      └── dynamically imports NSE 
 **Project:** `desktop-app/NEON.Trader.Desktop.sln`. Unpackaged (`WindowsPackageType=None`), runs as a plain `.exe`.
 
 **Architecture:**
-- `Services/ApiClient.cs` — typed `HttpClient`, self-signed cert bypass (for self-hosted), `X-API-Key` header, every endpoint the backend exposes.
+- `Services/ApiClient.cs` — typed `HttpClient`, self-signed cert bypass (for self-hosted backend), `X-API-Key` header, every endpoint the backend exposes.
 - `Services/SettingsService.cs` — multi-profile JSON persistence under `%LocalAppData%\NEON.Trader\settings.json`.
 - `Services/Indicators.cs` + `Services/Backtester.cs` — pure-C# SMA/EMA/RSI/Bollinger/ATR + an intrabar SL/TP backtest engine, **byte-for-byte matching the web JS implementation**, so results agree.
 - `Models/BackendProfile.cs` — NSE main / NSE eval / Forex profiles with per-profile URL + API key.
@@ -187,6 +187,6 @@ Both agents share: `data_fetcher`, `backtester`, `paper_trader`, `learner`, `mar
 - **Groww** — primary NSE data source. Live LTP + historical candles via REST (`groww_client.py`); market movers + fundamentals via Groww MCP at `https://mcp.groww.in/mcp/` (`groww_mcp.py`). Auth via `GROWW_API_KEY` (TOTP JWT) + `GROWW_TOTP_SECRET` (base32 seed). **No order code is wired — agent is paper-trade only.** Free tier caps all Live-Data endpoints (LTP/OHLC/Quote/historical) at 10 rps / 300 rpm shared; `groww_client._api_get` enforces 8 rps / 250 rpm client-side so we never trip 429. Full SDK reference at [`docs/GROWW_SDK.md`](docs/GROWW_SDK.md) — including a rate-limits section.
 - **yfinance** — fallback for index data (Groww doesn't serve INDEX segment) and supplementary Yahoo news + options-chain PCR in `news_sentiment.py`.
 - **pandas_market_calendars (XNSE)** — deterministic trading-day/holiday lookup in `market_calendar.py`. No API call.
-- **LLM cascade** (see `ai_strategy.py` in each agent + chat path in each backend): Copilot/Haiku → **Ollama (`nemotron-3-nano:4b` @ `http://BACKEND_HOST:11434`, self-hosted on self-hosted)** → OpenRouter → Groq → Cloudflare → Gemini. Ollama is chat-only (skipped on `want_json=True` — CPU inference is too slow for batch scans). Override with env vars `OLLAMA_BASE_URL` / `OLLAMA_MODEL`.
+- **LLM cascade** (see `ai_strategy.py` in each agent + chat path in each backend): Copilot/Haiku → **Ollama (`nemotron-3-nano:4b`, self-hosted, set `OLLAMA_BASE_URL`)** → OpenRouter → Groq → Cloudflare → Gemini. Ollama is chat-only (skipped on `want_json=True` — CPU inference is too slow for batch scans). Override with env vars `OLLAMA_BASE_URL` / `OLLAMA_MODEL`.
 - **Kaggle API** — Remote model training (NSE CatBoost retraining).
 - **Brokers** (expected integrations, not fully wired yet): Groww (read-only live data + MCP), HDFC Sky for NSE; TBD for Forex.

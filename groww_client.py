@@ -10,8 +10,8 @@ Drop-in replacement for a subset of yfinance calls. Two auth paths:
    to a JWT copied from Groww's web session / vendor dashboard. Expires
    daily; re-paste each morning.
 
-The token is IP-restricted to the deploy server (self-hosted-attached). On
-any auth/network failure, data_fetcher falls back to yfinance.
+The token is IP-restricted to the deploy server. On any auth/network
+failure, data_fetcher falls back to yfinance.
 """
 
 import base64
