@@ -16,5 +16,5 @@ prompt_toolkit>=3.0.43
 growwapi>=1.5.0
 pyotp>=2.9.0
 pandas_market_calendars>=4.4.0
-mcp>=1.0.0
+mcp>=1.27.0
 SQLAlchemy>=2.0.0
