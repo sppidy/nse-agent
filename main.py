@@ -334,12 +334,26 @@ Examples:
 """)
 
 
+def _log_data_source() -> None:
+    """One-line banner so users see which data source is active."""
+    try:
+        import groww_client
+        if groww_client.is_configured():
+            print("[data] Groww live-data API: configured (yfinance is fallback)")
+            return
+    except Exception:
+        pass
+    print("[data] yfinance only (Groww keys not set — see .env.example)")
+
+
 def main():
     if len(sys.argv) < 2:
         cmd_help()
         return
 
     command = sys.argv[1].lower()
+    if command not in ("help",):
+        _log_data_source()
     commands = {
         "scan": cmd_scan,
         "ai-scan": cmd_ai_scan,
