@@ -1,6 +1,6 @@
 # Setup Windows Task Scheduler for AI Trading Autopilot
 # Run this script as Administrator: Right-click PowerShell -> Run as Administrator
-# Then: powershell -ExecutionPolicy Bypass -File B:\projects\ai-trading-agent\setup_scheduler.ps1
+# Then: powershell -ExecutionPolicy Bypass -File <path-to-this-repo>\setup_scheduler.ps1
 
 $TaskName = "AI-Trading-Autopilot"
 $Description = "Runs AI Trading Agent autopilot during Indian market hours (Mon-Fri)"
