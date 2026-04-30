@@ -42,8 +42,8 @@ _COPILOT_MODELS = [
     "gpt-4o-mini",         # Cheap fallback
 ]
 
-# Ollama (self-hosted on self-hosted, OpenAI-compatible)
-_OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://BACKEND_HOST:11434/v1")
+# Ollama (self-hosted, OpenAI-compatible)
+_OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "")
 _OLLAMA_MODELS = [
     os.getenv("OLLAMA_MODEL", "nemotron-3-nano:4b"),
 ]
@@ -580,7 +580,7 @@ async def _call_ai_async(prompt: str, want_json: bool = False) -> str | list[Sig
     else:
         logger.info("    [CIRCUIT] Copilot in cooldown — skipping straight to Ollama")
 
-    # 2. Ollama (self-hosted on self-hosted, free) — CPU-only, too slow for batch
+    # 2. Ollama (self-hosted, free) — CPU-only, too slow for batch
     #    signal scans (~1.9 tok/s); chat-path only.
     if not want_json:
         if _provider_alive("ollama"):
