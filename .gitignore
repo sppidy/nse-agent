@@ -1,6 +1,7 @@
 # Environment & secrets
 .env
 .claude/
+.gemini/
 
 # Python
 __pycache__/
@@ -34,3 +35,5 @@ Desktop.ini
 #V Env
 venv/
 trading_agent.db
+nse-backend and common app.lnk
+forex-trading-agent.lnk
