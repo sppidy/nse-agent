@@ -1,0 +1,29 @@
+[Unit]
+Description=Janus NSE Autopilot
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/janus/nse-agent
+EnvironmentFile=-/etc/janus/nse.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/janus/nse-agent/venv/bin/python -u autopilot.py --interval 15
+Restart=on-failure
+RestartSec=60
+
+# Logs
+StandardOutput=append:/home/ubuntu/janus/nse-agent/logs/autopilot.log
+StandardError=append:/home/ubuntu/janus/nse-agent/logs/autopilot.log
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/janus/nse-agent
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
