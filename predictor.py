@@ -9,6 +9,7 @@ Model is trained in Google Colab (GPU) and deployed here for inference.
 """
 
 import os
+import hmac
 import json
 import pickle
 import hashlib
@@ -76,6 +77,58 @@ def _sha256_file(path: str) -> str:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _hmac_file(path: str, secret: bytes) -> str:
+    """HMAC-SHA256 of a file, using the given secret. Used to authenticate
+    pickle artifacts so an attacker with model-dir write access cannot swap
+    in a malicious pickle + matching plain SHA sidecar.
+    """
+    h = hmac.new(secret, digestmod=hashlib.sha256)
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _verify_pickle_integrity(model_path: str, sha_path: str) -> bool:
+    """Return True if the pickle file is safe to load.
+
+    Policy:
+      * If env var ``MODEL_HMAC_SECRET`` is set, require a matching ``.hmac``
+        sidecar next to the model. This is the strong path — an attacker
+        can't forge it without the secret.
+      * Otherwise, fall back to the plain SHA-256 sidecar (corruption
+        detection only — does NOT defend against tampering by anyone with
+        write access to the model dir).
+    """
+    secret_str = os.environ.get("MODEL_HMAC_SECRET", "")
+    hmac_path = model_path + ".hmac"
+    if secret_str:
+        secret = secret_str.encode("utf-8")
+        if not os.path.exists(hmac_path):
+            logger.error(
+                "MODEL_HMAC_SECRET is set but %s is missing — refusing to load. "
+                "Re-run training to regenerate the HMAC sidecar.", hmac_path,
+            )
+            return False
+        expected = Path(hmac_path).read_text(encoding="utf-8").strip()
+        actual = _hmac_file(model_path, secret)
+        if not hmac.compare_digest(expected, actual):
+            logger.error("HMAC mismatch on %s — refusing to load (model may be tampered).", model_path)
+            return False
+        return True
+
+    # No HMAC secret configured — fall back to plain SHA (corruption-only).
+    logger.warning(
+        "MODEL_HMAC_SECRET not set; pickle integrity is corruption-only "
+        "(plain SHA-256). Set MODEL_HMAC_SECRET in .env for tamper resistance."
+    )
+    if not os.path.exists(sha_path):
+        return True  # nothing to check
+    expected = Path(sha_path).read_text(encoding="utf-8").strip()
+    actual = _sha256_file(model_path)
+    return expected == actual
 
 
 def _get_training_log() -> list[dict]:
@@ -210,25 +263,19 @@ def _load_model():
         except Exception as e:
             logger.warning(f"Failed to load .cbm model: {e}")
 
-    # Fall back to pickle
+    # Fall back to pickle (with HMAC + SHA integrity check).
     if os.path.exists(MODEL_PKL):
-        if os.path.exists(MODEL_HASH_FILE):
-            expected = Path(MODEL_HASH_FILE).read_text(encoding="utf-8").strip()
-            actual = _sha256_file(MODEL_PKL)
-            if expected != actual:
-                logger.error("CatBoost model integrity check failed")
-                return None
+        if not _verify_pickle_integrity(MODEL_PKL, MODEL_HASH_FILE):
+            logger.error("CatBoost model integrity check failed — refusing to load")
+            return None
         with open(MODEL_PKL, "rb") as f:
             return pickle.load(f)
 
     # Legacy GradientBoosting model
     if os.path.exists(LEGACY_MODEL):
         logger.info("Loading legacy sklearn model (not CatBoost)")
-        if os.path.exists(LEGACY_HASH):
-            expected = Path(LEGACY_HASH).read_text(encoding="utf-8").strip()
-            actual = _sha256_file(LEGACY_MODEL)
-            if expected != actual:
-                return None
+        if not _verify_pickle_integrity(LEGACY_MODEL, LEGACY_HASH):
+            return None
         with open(LEGACY_MODEL, "rb") as f:
             return pickle.load(f)
 
@@ -441,6 +488,13 @@ def train_model(symbols: list[str] | None = None, period: str = "5y") -> dict:
     hash_path = MODEL_HASH_FILE if model_type == "catboost" else LEGACY_HASH
     with open(hash_path, "w", encoding="utf-8") as f:
         f.write(model_hash)
+
+    # If MODEL_HMAC_SECRET is set, also write a tamper-resistant HMAC sidecar.
+    secret_str = os.environ.get("MODEL_HMAC_SECRET", "")
+    if secret_str:
+        hmac_path = model_path + ".hmac"
+        with open(hmac_path, "w", encoding="utf-8") as f:
+            f.write(_hmac_file(model_path, secret_str.encode("utf-8")))
 
     if model_type == "catboost":
         model.save_model(MODEL_CBM)
