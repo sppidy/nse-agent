@@ -7,9 +7,9 @@ PYTHON="$WORK_DIR/venv/bin/python3"
 
 # Add cron entries
 (crontab -l 2>/dev/null; cat <<CRON
-# AI Trading Agent - Start autopilot Mon-Fri 9:00 AM IST
+# Janus - Start autopilot Mon-Fri 9:00 AM IST
 0 9 * * 1-5 cd $WORK_DIR && PYTHONUNBUFFERED=1 $PYTHON -u autopilot.py --interval 15 >> $WORK_DIR/logs/autopilot_\$(date +\%Y\%m\%d).log 2>&1 &
-# AI Trading Agent - Kill autopilot Mon-Fri 3:45 PM IST
+# Janus - Kill autopilot Mon-Fri 3:45 PM IST
 45 15 * * 1-5 pkill -f "autopilot.py --interval" 2>/dev/null
 CRON
 ) | crontab -

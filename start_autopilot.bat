@@ -1,6 +1,6 @@
 @echo off
 setlocal
-:: AI Trading Agent - Autopilot Launcher
+:: Janus - Autopilot Launcher
 :: Runs the trading bot during market hours (9:15 AM - 3:30 PM IST)
 
 set "SCRIPT_DIR=%~dp0"

@@ -1,4 +1,4 @@
-"""AI Trading Agent — Main entry point."""
+"""Janus — Main entry point."""
 
 import sys
 import time
@@ -305,7 +305,7 @@ def cmd_reset():
 
 def cmd_help():
     print("""
-AI Trading Agent — Paper Trading System
+Janus — Paper Trading System
 ========================================
 
 Commands:

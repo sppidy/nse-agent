@@ -1,6 +1,6 @@
 # nse-agent
 
-Paper-trading agent for NSE (Indian equities). Part of [`trading-agent`](https://github.com/sppidy/trading-agent).
+Paper-trading agent for NSE (Indian equities). Part of [`janus`](https://github.com/sppidy/janus).
 
 - Rule-based strategy (RSI / EMA crossovers) + Gemini/Groq/Cloudflare LLM signals (cascade fallback)
 - Local CatBoost direction predictor (~45 engineered features) with walk-forward retraining and promotion gates
@@ -49,4 +49,4 @@ python main.py autopilot --force                          # market-hours simulat
 
 ## License
 
-[Apache-2.0](LICENSE). Contributing guidelines and security policy live in the [super-repo](https://github.com/sppidy/trading-agent).
+[Apache-2.0](LICENSE). Contributing guidelines and security policy live in the [super-repo](https://github.com/sppidy/janus).

@@ -1,5 +1,5 @@
 #!/bin/bash
-# AI Trading Agent - Autopilot Launcher (Linux/Server)
+# Janus - Autopilot Launcher (Linux/Server)
 
 cd "$(dirname "$0")"
 

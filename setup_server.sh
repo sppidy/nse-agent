@@ -1,10 +1,10 @@
 #!/bin/bash
-# AI Trading Agent - Server Setup Script
+# Janus - Server Setup Script
 # Run once after cloning the repo on your server
 
 set -e
 
-echo "=== AI Trading Agent - Server Setup ==="
+echo "=== Janus - Server Setup ==="
 
 # 1. Create virtual environment
 echo "[1/5] Creating Python virtual environment..."
@@ -37,7 +37,7 @@ PYTHON_PATH="$(pwd)/venv/bin/python3"
 
 cat > /tmp/ai-trading-agent.service <<SVCEOF
 [Unit]
-Description=AI Trading Agent Autopilot
+Description=Janus Autopilot
 After=network.target
 
 [Service]

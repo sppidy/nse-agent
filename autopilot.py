@@ -779,7 +779,7 @@ def run_autopilot(interval_min: int = 15, use_ai: bool = True, force: bool = Fal
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="AI Trading Agent Autopilot")
+    parser = argparse.ArgumentParser(description="Janus Autopilot")
     parser.add_argument("--interval", type=int, default=15, help="Minutes between cycles (default: 15)")
     parser.add_argument("--no-ai", action="store_true", help="Use rule-based strategy instead of AI")
     parser.add_argument("--force", action="store_true", help="Run outside market hours (for testing)")

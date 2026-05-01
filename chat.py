@@ -1,4 +1,4 @@
-"""Interactive chat interface for the AI Trading Agent — Rich UI edition."""
+"""Interactive chat interface for the Janus — Rich UI edition."""
 
 import os
 import sys
